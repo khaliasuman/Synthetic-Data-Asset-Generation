@@ -33,20 +33,16 @@ def run(prompt: str, skills_root: str | Path, out_root: str | Path, llm,
     # respected client-dna's bounds itself. Confirmed unreliable: two consecutive
     # live runs resolved library_type outside its declared scope despite explicit
     # prompt instructions. This check is deterministic and cannot be skipped.
+    #
+    # Materialize even on a violation, rather than halting: a human reviewing a
+    # needs_review plan needs to actually SEE the generated notebooks/YAML to make
+    # an informed approve/reject decision. Approving something you can't inspect
+    # isn't a real review. The violation banner still shows first regardless.
+    dna_flagged = False
     if generation_mode == "client_default":
         plan = dna_check.enforce(plan, skillset)
         if plan["plan_status"] == "needs_review":
-            # Halt before materialization: building real files (and a real wheel)
-            # for a plan that violates approved scope wastes compute on an
-            # artifact that's already known to be invalid. Flag and stop here;
-            # the violation detail in plan["dna_violations"] is enough for a
-            # human to decide whether to adjust the request or approve an
-            # exception, without spending a wheel build on it first.
-            return {
-                "status": "needs_review",
-                "plan": plan,
-                "router_output": router_output,
-            }
+            dna_flagged = True
 
     plan["expected"] = oracle.run(plan, skillset)
 
@@ -55,10 +51,12 @@ def run(prompt: str, skills_root: str | Path, out_root: str | Path, llm,
 
     check_results = validator.run(plan, out_dir)
     summary = validator.summarize(check_results)
-    plan["plan_status"] = "materialized" if summary["all_passed"] else "needs_review"
+    # A dna violation always wins the status label, even if validation also passed --
+    # the point is the reviewer sees "needs_review" and why, with the bundle attached.
+    plan["plan_status"] = "needs_review" if (dna_flagged or not summary["all_passed"]) else "materialized"
 
     return {
-        "status": "ok",
+        "status": "needs_review" if dna_flagged else "ok",
         "plan": plan,
         "validation": summary,
         "out_dir": str(out_dir),
