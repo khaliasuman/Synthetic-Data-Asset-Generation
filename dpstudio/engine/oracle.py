@@ -56,12 +56,19 @@ def _match(sig: dict, flat: dict) -> bool:
         if len(flat.get("table_physical", {}).get(c["field"], [])) > c["max"]:
             return True
     if "any_of" in m:
+        tp = flat.get("table_physical", {}) or {}
         for sub in m["any_of"]:
             for kk, vv in sub.items():
                 base = kk.rsplit("_", 1)[0]
-                if kk.endswith("_gt") and flat.get(base, 0) > vv:
+                # numeric fields describing table_physical live INSIDE that nested
+                # dict (e.g. table_physical.partition_count), not at the top level
+                # of the flattened bundle. Check there first, fall back to flat.
+                val = tp.get(base, flat.get(base))
+                if val is None:
+                    continue
+                if kk.endswith("_gt") and val > vv:
                     return True
-                if kk.endswith("_lt") and flat.get(base, 10**18) < vv:
+                if kk.endswith("_lt") and val < vv:
                     return True
     return False
 
