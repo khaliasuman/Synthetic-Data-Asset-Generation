@@ -51,6 +51,15 @@ def run(plan: dict, out_dir: str | Path) -> list[tuple[str, bool, str]]:
         check("negative_scenario_has_injected_signal",
               bool(plan["expected"]["matched_signals"]), "no signals matched")
 
+    if plan.get("scenario_type") == "positive":
+        bad_verdicts = {"blocked", "not_recommended"}
+        actual_verdict = plan["expected"]["verdict"]
+        check("positive_scenario_should_be_clean",
+              actual_verdict not in bad_verdicts,
+              f"scenario_type=positive but oracle verdict={actual_verdict}; "
+              f"planner likely produced a structurally contradictory plan "
+              f"(check matched_signals for the specific conflict)")
+
     dx = plan.get("distractors", [])
     if plan.get("scenario_type") == "distractor":
         check("distractor_scenario_stays_clean", not plan["expected"]["matched_signals"],
