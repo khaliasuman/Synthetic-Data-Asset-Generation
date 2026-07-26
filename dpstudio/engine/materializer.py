@@ -95,7 +95,7 @@ resources:
       tasks:
         - task_key: main_task
           notebook_task:
-            notebook_path: ./{entry}
+            notebook_path: ./src/notebooks/{entry}.py
 {lib_line}
 """
 
