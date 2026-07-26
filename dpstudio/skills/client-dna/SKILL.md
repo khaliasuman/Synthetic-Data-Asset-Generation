@@ -94,7 +94,7 @@ dimension_profiles:
     applies_to: any
     default: whl_workspace_file
     bounds:
-      in_scope: [internal_utils_module, whl_workspace_file]
+      in_scope: [whl_workspace_file]
     status: pending
     evidence: "real bundles show internal utility modules (e.g. shared helpers, credential/secret-handling folders) far more often than external package declarations; external dependency field in one export source was found unreliable and excluded"
 
