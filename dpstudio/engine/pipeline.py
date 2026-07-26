@@ -35,6 +35,18 @@ def run(prompt: str, skills_root: str | Path, out_root: str | Path, llm,
     # prompt instructions. This check is deterministic and cannot be skipped.
     if generation_mode == "client_default":
         plan = dna_check.enforce(plan, skillset)
+        if plan["plan_status"] == "needs_review":
+            # Halt before materialization: building real files (and a real wheel)
+            # for a plan that violates approved scope wastes compute on an
+            # artifact that's already known to be invalid. Flag and stop here;
+            # the violation detail in plan["dna_violations"] is enough for a
+            # human to decide whether to adjust the request or approve an
+            # exception, without spending a wheel build on it first.
+            return {
+                "status": "needs_review",
+                "plan": plan,
+                "router_output": router_output,
+            }
 
     plan["expected"] = oracle.run(plan, skillset)
 
