@@ -47,6 +47,18 @@ def run(plan: dict, out_dir: str | Path) -> list[tuple[str, bool, str]]:
     ok, detail = _graph_ok(plan)
     check("graph_well_formed", ok, detail)
 
+    # A reference-mechanism line (magic_run/%run, dbutils.notebook.run) written
+    # literally inside a node's executable code is always a planner duplication
+    # bug: those mechanisms are declared once via code_graph.edges and rendered
+    # by the materializer. A literal copy sitting in executable code is dead or
+    # invalid code, not a real defect signal.
+    dupe_ref_lines = []
+    for nid, node_code in plan.get("_node_code", {}).items():
+        for line in node_code.get("executable", []):
+            if "%run " in line or "dbutils.notebook.run(" in line:
+                dupe_ref_lines.append((nid, line.strip()))
+    check("no_duplicated_reference_mechanism", not dupe_ref_lines, str(dupe_ref_lines))
+
     if plan.get("scenario_type") == "negative":
         check("negative_scenario_has_injected_signal",
               bool(plan["expected"]["matched_signals"]), "no signals matched")

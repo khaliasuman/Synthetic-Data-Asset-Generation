@@ -82,7 +82,15 @@ dimension_profiles:
     applies_to: any
     default: [python_import, magic_run]
     status: pending
-    evidence: "inferred from module layout, not directly observed in source"
+    evidence: >
+      Real HP jobs follow a consistent shape, not an arbitrary mix: one orchestrator
+      node navigates to child notebooks via magic_run/dbutils_notebook_run, while
+      distinct internal-utility modules (shared helpers, credential-handling code)
+      are reached via python_import directly from wherever they're used -- not
+      chained through the orchestrator. This mirrors the app/ + libraries/*/
+      workflow/*_wrapper+*_invoker structure seen in the real job export (e.g. the
+      Triage bundle). A generation using magic_run to reach what should be a
+      python_import module does not match this pattern.
 
   - dimension: job_trigger
     applies_to: any
@@ -94,7 +102,7 @@ dimension_profiles:
     applies_to: any
     default: whl_workspace_file
     bounds:
-      in_scope: [none, whl_workspace_file]
+      in_scope: [whl_workspace_file]
     status: pending
     evidence: "real bundles show internal utility modules (e.g. shared helpers, credential/secret-handling folders) far more often than external package declarations; external dependency field in one export source was found unreliable and excluded"
 
@@ -203,4 +211,3 @@ already solves honestly.
 that's the moment to add an entry — via `extension_pattern` — not to force the request
 through an existing entry that doesn't really fit. A slightly-wrong forced match is worse
 than an honest `pending` entry with a rough first-pass value.
-

@@ -44,6 +44,27 @@ YOUR JOB, IN ORDER:
    node_code[node_id].executable -- real runnable-looking lines, not prose descriptions.
    This is the only literal code you produce; the materializer wraps it into full files.
 
+   CRITICAL: never write a reference-mechanism line yourself inside node_code
+   (e.g. "%run ./other_node", "dbutils.notebook.run(...)", an import of another
+   NODE you already declared as an edge). Those come ONLY from the code_graph.edges
+   you declare via reference_mechanism, and the materializer renders them. If you
+   also write the same %run or dbutils.notebook.run line as a literal executable
+   line, it gets duplicated -- once correctly as a real notebook magic command, once
+   incorrectly as dead/invalid code sitting inside the executable body. node_code
+   should contain ONLY the node's own business logic (reading data, transforming,
+   writing, calling a genuinely external/already-imported function) -- never a line
+   that duplicates an edge you already declared.
+
+2c. When composing a MULTI-MODULE positive scenario (node_count >= 3), follow this
+    real production shape rather than an arbitrary graph: one entry/orchestrator node
+    that navigates to children via magic_run or dbutils_notebook_run edges (this is
+    the ONLY place those mechanisms belong), plus one or more separate MODULE-role
+    nodes (schema/helper/utility logic) reached via python_import edges from the
+    entry node, not chained through the orchestrator. Do not make python_import
+    nodes children of a %run chain; import them directly where their logic is used.
+    This mirrors real HP production jobs: an orchestrator notebook plus distinct
+    internal utility modules imported as code, not run as sub-notebooks.
+
 2b. table_physical fields are MUTUALLY EXCLUSIVE per the feature skill's own rules --
     check each feature skill's eligibility_signals and apply_rules for constraint pairs
     (e.g. a table cannot have both partition_by AND cluster_by set at once; ZORDER and
