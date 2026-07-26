@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from . import intent_router, planner, oracle, materializer, validator
+from . import intent_router, planner, oracle, materializer, validator, dna_check
 from .skills import SkillSet
 
 
@@ -28,6 +28,13 @@ def run(prompt: str, skills_root: str | Path, out_root: str | Path, llm,
     plan["generation_mode"] = generation_mode
     if plan["plan_status"] == "invalid":
         return {"status": "invalid", "plan": plan}
+
+    # Code-level client-dna enforcement -- do NOT rely on the planner LLM to have
+    # respected client-dna's bounds itself. Confirmed unreliable: two consecutive
+    # live runs resolved library_type outside its declared scope despite explicit
+    # prompt instructions. This check is deterministic and cannot be skipped.
+    if generation_mode == "client_default":
+        plan = dna_check.enforce(plan, skillset)
 
     plan["expected"] = oracle.run(plan, skillset)
 
