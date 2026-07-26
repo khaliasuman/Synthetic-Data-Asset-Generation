@@ -90,9 +90,9 @@ dimension_profiles:
     status: reviewed
     evidence: "manual trigger share observed at roughly 40-45% across the job metadata export — the largest single category"
 
-  - dimension: library_pattern
+  - dimension: library_type
     applies_to: any
-    default: internal_utils_module
+    default: whl_workspace_file
     bounds:
       in_scope: [internal_utils_module, whl_workspace_file]
     status: pending
@@ -203,3 +203,4 @@ already solves honestly.
 that's the moment to add an entry — via `extension_pattern` — not to force the request
 through an existing entry that doesn't really fit. A slightly-wrong forced match is worse
 than an honest `pending` entry with a rough first-pass value.
+
