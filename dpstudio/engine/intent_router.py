@@ -8,6 +8,8 @@ shown.
 """
 from __future__ import annotations
 
+import re
+
 from .llm import DatabricksLLM, StubLLM
 from .skills import SkillSet
 
@@ -21,6 +23,17 @@ Given a user prompt requesting a synthetic test scenario, determine:
 registered set: {registered_features}. A request may name one, several, or none \
 explicitly. If a named capability is not in this set, do not invent an id --
 set needs_clarification true instead.
+
+   CRITICAL -- COMPLETENESS: if the prompt names multiple capabilities (e.g.
+   "serverless AND liquid clustering AND photon", or "assess X, Y, and Z"),
+   target_features MUST include every one of them. Do not narrow the list to
+   only the most prominent, most recently mentioned, or most specific capability.
+   A request combining three named features is a request to evaluate all three
+   together -- dropping one silently produces an incomplete plan that looks
+   complete, which is the single most dangerous failure mode this router can
+   produce. Re-read the prompt once specifically checking that every registered
+   feature name or its synonyms that appear in the text also appears in your
+   target_features list before finalizing your answer.
 
 2. complexity_hint: "simple", "moderate", or "high", based on language cues only.
 
@@ -42,8 +55,48 @@ Output ONLY this JSON shape, nothing else, no markdown fences:
 }}
 """
 
+# Synonyms used for the code-level cross-check below. Kept intentionally small
+# and literal -- this is a safety net catching an obvious keyword miss, not a
+# second classifier.
+_FEATURE_KEYWORDS = {
+    "serverless": ["serverless"],
+    "liquid_clustering": ["liquid clustering", "liquid_clustering", "cluster by", "clustering"],
+    "photon": ["photon"],
+}
+
+
+def _keyword_cross_check(prompt: str, target_features: list[str], registered: list[str]) -> list[str]:
+    """Code-level safety net: same pattern as dna_check and normalize_table_physical
+    elsewhere in this codebase -- an instruction alone has already proven capable
+    of silently dropping an explicitly-named feature (confirmed live: a prompt
+    naming serverless, liquid clustering, and photon together classified only
+    serverless and photon). This does not replace the LLM's judgment; it only
+    flags an obvious literal-keyword miss for visibility.
+    """
+    prompt_lower = prompt.lower()
+    missed = []
+    for feat in registered:
+        if feat in target_features:
+            continue
+        keywords = _FEATURE_KEYWORDS.get(feat, [feat.replace("_", " ")])
+        if any(kw in prompt_lower for kw in keywords):
+            missed.append(feat)
+    return missed
+
 
 def classify(prompt: str, skillset: SkillSet, llm) -> dict:
     registered = skillset.registered_features()
     system = SYSTEM_PROMPT.format(registered_features=registered)
-    return llm.complete_json(system=system, user=prompt)
+    result = llm.complete_json(system=system, user=prompt)
+
+    missed = _keyword_cross_check(prompt, result.get("target_features", []), registered)
+    if missed:
+        result.setdefault("target_features", [])
+        result["target_features"] = list(dict.fromkeys(result["target_features"] + missed))
+        result["router_notes"] = (
+            f"keyword_cross_check added {missed} -- these feature names appeared "
+            f"literally in the prompt but were missing from the classifier's own "
+            f"target_features list."
+        )
+
+    return result
