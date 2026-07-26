@@ -55,6 +55,13 @@ def run(prompt: str, skills_root: str | Path, out_root: str | Path, llm,
     # the point is the reviewer sees "needs_review" and why, with the bundle attached.
     plan["plan_status"] = "needs_review" if (dna_flagged or not summary["all_passed"]) else "materialized"
 
+    # Persist the full plan JSON alongside the materialized bundle. Without this,
+    # the plan (knobs, code_graph, expected verdict, dna_violations) only ever
+    # existed as an in-memory dict and was never actually inspectable after the
+    # fact -- exactly the "where can I see the plan" gap this closes.
+    import json
+    (out_dir / "plan.json").write_text(json.dumps(plan, indent=2, default=str))
+
     return {
         "status": "needs_review" if dna_flagged else "ok",
         "plan": plan,
