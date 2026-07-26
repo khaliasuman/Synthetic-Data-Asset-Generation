@@ -167,6 +167,41 @@ def resolve_interactions(per_feature: list[dict], asset: dict, skillset: SkillSe
     return applied
 
 
+def normalize_table_physical(plan: dict) -> dict:
+    """Enforces the grammar's own declared apply_cluster_keys rule as real code,
+    rather than hoping the planner LLM applies it correctly.
+
+    Confirmed unreliable across three separate live runs (Haiku once, Sonnet twice,
+    including after an explicit planner-instruction fix): the planner repeatedly
+    emits table_physical with BOTH partition_by and cluster_by present at once when
+    describing a table migrating from partitioning to clustering. The grammar
+    itself declares these mutually exclusive and says the old key should be
+    removed -- this function does that removal in code instead of relying on the
+    model to have followed the instruction.
+
+    Only applies to POSITIVE scenarios. A negative/edge scenario may be
+    deliberately injecting this exact conflict as its signal -- stripping it there
+    would silently break the test case rather than fix a mistake.
+    """
+    if plan.get("scenario_type") != "positive":
+        return plan
+
+    for asset in plan.get("assets", []):
+        tp = asset.get("table_physical", {})
+        if tp.get("cluster_by") and any(tp.get(k) for k in
+                                        ("partition_by", "zorder_by", "bucket_by", "num_buckets")):
+            removed = {k: tp.pop(k) for k in
+                      ("partition_by", "zorder_by", "bucket_by", "num_buckets") if k in tp}
+            plan.setdefault("plan_notes", "")
+            plan["plan_notes"] = (
+                f"{plan['plan_notes']} normalize_table_physical: removed {list(removed.keys())} "
+                f"-- cluster_by present alongside them in a positive scenario, which the grammar "
+                f"declares mutually exclusive. Values removed: {removed}."
+            ).strip()
+
+    return plan
+
+
 def run(plan: dict, skillset: SkillSet) -> dict:
     """Compute plan.expected. Called once, before materialization, and frozen."""
     nodes = {n["node_id"]: plan["_node_code"][n["node_id"]] for n in plan["code_graph"]["nodes"]}

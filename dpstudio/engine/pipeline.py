@@ -44,6 +44,7 @@ def run(prompt: str, skills_root: str | Path, out_root: str | Path, llm,
         if plan["plan_status"] == "needs_review":
             dna_flagged = True
 
+    plan = oracle.normalize_table_physical(plan)
     plan["expected"] = oracle.run(plan, skillset)
 
     out_dir = Path(out_root) / plan["plan_id"]
