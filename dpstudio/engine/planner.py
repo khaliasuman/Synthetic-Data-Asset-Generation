@@ -43,6 +43,16 @@ YOUR JOB, IN ORDER:
    node reachable. For each node, write a SHORT literal code snippet (1-4 lines) in
    node_code[node_id].executable -- real runnable-looking lines, not prose descriptions.
    This is the only literal code you produce; the materializer wraps it into full files.
+
+2b. table_physical fields are MUTUALLY EXCLUSIVE per the feature skill's own rules --
+    check each feature skill's eligibility_signals and apply_rules for constraint pairs
+    (e.g. a table cannot have both partition_by AND cluster_by set at once; ZORDER and
+    cluster_by are likewise exclusive). When describing a table that is migrating FROM
+    one layout TO another (e.g. "was partitioned, now benefits from clustering"), the
+    resolved table_physical must reflect ONLY the target state -- do not carry the prior
+    layout's key forward into the same object alongside the new one. If you need to show
+    the "before" state for narrative context, put it in plan_notes as prose, never as a
+    literal field alongside its mutually-exclusive replacement.
 3. If scenario_type is negative/edge: pick a signal from the loaded feature skill's
    eligibility_signals, check placement_eligibility for it, and inject it into the
    node_code at that placement (i.e. write the actual line of code that trips that
