@@ -62,12 +62,59 @@ class DatabricksLLM:
                 {"role": "user", "content": user},
             ],
         )
-        text = resp.choices[0].message.content
+        content = resp.choices[0].message.content
+        # Reasoning-style models (e.g. gpt-oss) return a list of typed blocks
+        # ({"type": "reasoning", ...}, {"type": "text", ...}) instead of a plain
+        # string. Extract only the actual answer text, skip reasoning/thinking blocks.
+        if isinstance(content, list):
+            text = "".join(
+                block.get("text", "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        else:
+            text = content
         return LLMResponse(text=text, raw=resp.model_dump())
 
     def complete_json(self, system: str, user: str, max_tokens: int = 2000) -> dict:
         """Calls complete() and parses the result as JSON, stripping code fences
         if the model wraps its output in ```json ... ``` despite instructions not to."""
+        r = self.complete(system, user, max_tokens=max_tokens)
+        text = r.text.strip()
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0]
+        return json.loads(text)
+
+
+class AnthropicLLM:
+    """Direct calls to api.anthropic.com using your own API key. Confirmed reachable
+    from Free Edition (both api.anthropic.com and api.openai.com return real HTTP
+    responses rather than connection errors -- egress isn't blocked for these).
+
+    Prefer dbutils.secrets over a hardcoded key once this leaves quick testing --
+    see the notebook entrypoint for the pattern.
+    """
+
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5"):
+        import anthropic
+        self._client = anthropic.Anthropic(api_key=api_key)
+        self.model = model
+
+    def complete(self, system: str, user: str, max_tokens: int = 2000,
+                 temperature: float = 0.0) -> LLMResponse:
+        resp = self._client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        # Anthropic responses are a list of content blocks; take the text ones.
+        text = "".join(b.text for b in resp.content if b.type == "text")
+        return LLMResponse(text=text, raw=resp.model_dump())
+
+    def complete_json(self, system: str, user: str, max_tokens: int = 2000) -> dict:
         r = self.complete(system, user, max_tokens=max_tokens)
         text = r.text.strip()
         if text.startswith("```"):
