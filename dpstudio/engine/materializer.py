@@ -100,7 +100,35 @@ resources:
 """
 
 
+def _strip_duplicated_reference_lines(plan: dict) -> dict:
+    """Deterministically removes any literal magic_run/dbutils_notebook_run line
+    from a node's executable code. Those mechanisms are declared once via
+    code_graph.edges and rendered by _render_notebook -- a literal copy in
+    executable code is always a planner duplication, never intentional content.
+
+    Promoted from instruction-only (planner.py) to a code guarantee after the
+    instruction failed a second time on a different scenario shape (a
+    library-backed pipeline) than the one it was originally fixed against.
+    Same escalation pattern as normalize_table_physical.
+    """
+    for node_id, node_code in plan.get("_node_code", {}).items():
+        executable = node_code.get("executable", [])
+        cleaned = [line for line in executable
+                  if "%run " not in line and "dbutils.notebook.run(" not in line]
+        if len(cleaned) != len(executable):
+            removed = [l for l in executable if l not in cleaned]
+            plan.setdefault("plan_notes", "")
+            plan["plan_notes"] = (
+                f"{plan['plan_notes']} strip_duplicated_reference_lines: removed "
+                f"{removed} from node {node_id} -- already rendered via a "
+                f"code_graph edge, duplicate literal line discarded."
+            ).strip()
+            node_code["executable"] = cleaned
+    return plan
+
+
 def materialize(plan: dict, out_dir: str | Path) -> dict:
+    plan = _strip_duplicated_reference_lines(plan)
     out_dir = Path(out_dir)
     (out_dir / "src" / "notebooks").mkdir(parents=True, exist_ok=True)
     (out_dir / "src" / "sql").mkdir(parents=True, exist_ok=True)
