@@ -59,6 +59,21 @@ def run(plan: dict, out_dir: str | Path) -> list[tuple[str, bool, str]]:
                 dupe_ref_lines.append((nid, line.strip()))
     check("no_duplicated_reference_mechanism", not dupe_ref_lines, str(dupe_ref_lines))
 
+    # A library_type knob claiming a real library exists ("whl_workspace_file")
+    # with library_count >= 1 must be backed by an actual library_src node in the
+    # graph -- otherwise the plan claims a dependency that never gets materialized.
+    # Confirmed as a real, live gap: a plan set library_type=whl_workspace_file
+    # with no library_src node anywhere, and no wheel was ever built.
+    lib_type = plan.get("knobs", {}).get("library_type")
+    lib_count = plan.get("knobs", {}).get("library_count", 0)
+    if lib_type and lib_type != "none" and lib_count >= 1:
+        has_lib_node = any(n.get("role") == "library_src"
+                           for n in plan.get("code_graph", {}).get("nodes", []))
+        check("library_knob_has_backing_node", has_lib_node,
+              f"knobs.library_type={lib_type!r} with library_count={lib_count} but no "
+              f"code_graph node has role='library_src' -- the plan claims a library "
+              f"exists but nothing will be materialized for it.")
+
     if plan.get("scenario_type") == "negative":
         check("negative_scenario_has_injected_signal",
               bool(plan["expected"]["matched_signals"]), "no signals matched")

@@ -65,6 +65,23 @@ YOUR JOB, IN ORDER:
     This mirrors real HP production jobs: an orchestrator notebook plus distinct
     internal utility modules imported as code, not run as sub-notebooks.
 
+    IMPORTANT -- mechanism diversity: when reference_mechanism_mix includes both
+    magic_run AND dbutils_notebook_run and reference_depth >= 2, use
+    dbutils_notebook_run for at least one orchestrator->child edge instead of
+    defaulting to magic_run for all of them. A mechanism listed as available but
+    never actually chosen is not being tested. Vary which one you pick across a
+    session rather than always reaching for magic_run out of habit.
+
+2d. IMPORTANT -- knobs.library_type must be BACKED BY A REAL NODE, not just set as
+    a value with nothing behind it. If knobs.library_type is "whl_workspace_file"
+    and knobs.library_count >= 1, the code_graph MUST include at least one node
+    with role="library_src" whose node_code.executable contains real library
+    function code, referenced via a python_import edge from wherever it's used.
+    Setting library_type in knobs without creating the corresponding library_src
+    node produces a plan that claims a library exists but never materializes one --
+    this is a real, previously-confirmed defect. If library_type is "none", do not
+    create a library_src node at all.
+
 2b. table_physical fields are MUTUALLY EXCLUSIVE per the feature skill's own rules --
     check each feature skill's eligibility_signals and apply_rules for constraint pairs
     (e.g. a table cannot have both partition_by AND cluster_by set at once; ZORDER and
