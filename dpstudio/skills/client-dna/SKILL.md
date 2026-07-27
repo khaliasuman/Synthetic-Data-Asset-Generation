@@ -31,7 +31,7 @@ Three invariants:
 ## Machine-readable zone
 
 ```yaml
-version: "1.0"
+version: "2.0"
 composes_with:
   grammar: asset-bundle-generation
   grammar_version: ">=2.0"
@@ -44,9 +44,25 @@ composes_with:
 review_state: partial
 evidence_sources:
   - kind: job_metadata_export
-    description: "job-level metadata across ~1,100 job records, including compute/cluster shape, trigger type, and parameter payloads"
+    description: >
+      Job-level metadata across ~1,100 job records (combined export) plus a 182-row cumulus
+      export and a 55-row dev export. NOTE: the dependent_libraries, schedules, compute, and
+      parameters columns are empty or error-filled in the cumulus and dev CSVs (extraction
+      bug: "'JobSettings' object has no attribute 'libraries'" appears verbatim) — metadata
+      conclusions below rest on bundle code, not these columns.
   - kind: structured_job_bundles
-    description: "~60 fully-extracted job bundles showing real folder structure, module composition, and reference depth"
+    description: >
+      ~60 fully-extracted job bundles (original export) plus 8 cumulus repo bundles
+      (dps_workflow at 339 files, dps_etl_utils_lib with real setup.py + .whl) plus 40+
+      dev-environment job bundles (udm-*, lf-idp-*, onecloud-*, aa-*) showing real folder
+      structure, module composition, reference mechanisms, widget parameterization, and
+      language mix.
+  - kind: dataos_pipeline_exports
+    description: >
+      80 DataOS pipeline JSON exports with per-pipeline dependency trees (depth 1–6,
+      median 5), cadence (100% daily in this slice), cron schedules with timezone
+      (e.g. "13 0 7 * * ? (America/Los_Angeles)"), DBR versions 11.3–15.4, and
+      LLM-classified pipeline types (70 pyspark / 10 python).
 
 # =====================================================================
 # DIMENSION PROFILES — extensible registry. Each entry supplies a
@@ -60,60 +76,152 @@ dimension_profiles:
   - dimension: task_count
     applies_to: any
     default: 1
-    bounds: { max: 2 }
+    bounds:
+      max: 2
     status: reviewed
-    evidence: "task-count-per-job distribution across the job metadata export; observed max is 2"
+    evidence: "task-count-per-job distribution across the job metadata export; observed max is 2. Confirmed by dev-corpus job bundles: every extracted job carries a single entry notebook path (one *_wrapper per job)."
 
   - dimension: node_count
     applies_to: any
     default: 3
-    bounds: { max: 6 }
-    status: reviewed
-    evidence: "module/folder count per job bundle — most real jobs carry 3+ distinct code modules under a single task"
+    bounds:
+      max: 8
+    status: pending
+    evidence: >
+      Module/folder count per job bundle — most real jobs carry 3+ distinct code modules
+      under a single task. Dev-corpus bundles run larger than the original export suggested:
+      udm-printer-model carries workflow + bat + common (2 modules) + a dependencies tree of
+      9 shared notebooks; aa-supplyjournal carries 20+ modules across src/redshift,
+      src/postProcess, src/mfg, src/config. Max raised 6 -> 8 to admit the observed richer
+      composition; default stays 3 (typical single-purpose job). Marked pending until the
+      raised bound is confirmed as generation-appropriate rather than repo-accumulation.
 
   - dimension: reference_depth
     applies_to: any
     default: 2
-    bounds: { max: 3 }
+    bounds:
+      max: 5
     status: pending
-    evidence: "derived from folder depth in structured bundles; not yet confirmed against actual %run/import chains"
+    evidence: >
+      Originally derived from folder depth in structured bundles (max 3). DataOS
+      fileDependencyTree exports now give direct chain measurements: depth 1–6, median 5
+      (e.g. workflow_invoker -> workflow_params -> credentials_for_enterprise ->
+      aws_secrets_manager). Max raised 3 -> 5 accordingly. Default stays 2 — deep chains
+      exist but the entry->child->module shape remains the common case.
 
   - dimension: reference_mechanism_mix
     applies_to: any
     default: [python_import, magic_run, dbutils_notebook_run]
     status: pending
     evidence: >
-      Real HP jobs follow a consistent shape, not an arbitrary mix: one orchestrator
-      node navigates to child notebooks via magic_run/dbutils_notebook_run, while
-      distinct internal-utility modules (shared helpers, credential-handling code)
-      are reached via python_import directly from wherever they're used -- not
-      chained through the orchestrator. This mirrors the app/ + libraries/*/
-      workflow/*_wrapper+*_invoker structure seen in the real job export (e.g. the
-      Triage bundle). A generation using magic_run to reach what should be a
-      python_import module does not match this pattern. dbutils_notebook_run
-      belongs alongside magic_run as an orchestrator-navigation mechanism (both are
-      valid ways to call a child notebook) -- it should genuinely appear sometimes,
-      not be listed as allowed and never actually used.
+      Real HP jobs follow a consistent shape, not an arbitrary mix: one orchestrator node
+      navigates to child notebooks via magic_run/dbutils_notebook_run, while distinct
+      internal-utility modules (shared helpers, credential-handling code) are reached via
+      python_import directly from wherever they're used — not chained through the
+      orchestrator. This mirrors the app/ + libraries/* + workflow/*_wrapper+*_invoker
+      structure seen across all bundle corpora (Triage bundle, dps_workflow's
+      pipeline_engine, dataos workflow_invoker trees). QUANTIFIED in the dev corpus:
+      magic_run appears ~227 times vs dbutils_notebook_run ~4 times across three
+      representative bundles — both are real, but generation should treat magic_run as
+      dominant and dbutils_notebook_run as an occasional variant (roughly a 50:1 ratio,
+      not 50:50). Entry notebooks follow a *_wrapper / *_invoker naming convention
+      (processor_wrapper, udm_workflow_full_printer_wrapper, workflow_invoker).
 
   - dimension: job_trigger
     applies_to: any
-    default: manual
-    status: reviewed
-    evidence: "manual trigger share observed at roughly 40-45% across the job metadata export — the largest single category"
+    default: schedule
+    bounds:
+      in_scope: [manual, schedule]
+    status: pending
+    evidence: >
+      CONFLICTING SLICES, documented honestly: the original ~1,100-row export showed manual
+      as the largest single category (~40-45%). The DataOS corpus (80 pipelines) is 100%
+      daily cadence, 34/80 with explicit Quartz cron + timezone (e.g. "13 0 7 * * ?
+      (America/Los_Angeles)"); the cumulus CSV shows 56/182 cron; dev-corpus job names carry
+      -daily/-stage suffixes implying scheduled execution. Default moved manual -> schedule
+      on the strength of the newer corpora; both values stay in scope. Needs an SME call on
+      which slice better represents the generation target — this is exactly the kind of
+      conflict a human should resolve, not a file.
+
+  - dimension: param_passing
+    applies_to: any
+    default: widgets
+    bounds:
+      in_scope: [none, widgets]
+    status: pending
+    evidence: >
+      The single most consistent code pattern in the entire corpus: ~237 dbutils.widgets
+      occurrences across three representative dev bundles alone. The canonical entry-notebook
+      preamble is: dbutils.widgets.removeAll(), then a block of widgets.text(name, "") /
+      widgets.get(name) pairs (udm-printer-model declares 13 named widgets before any logic:
+      receive_date, stack_name, spark_input_read_path, redshift_iam_role, secret_name, ...).
+      DataOS job exports carry matching parameters payloads (teamName, jobId, runBy).
+      Widget-driven parameterization is the norm at this client, not an edge case —
+      generated entry notebooks that take no parameters at all do not resemble production.
 
   - dimension: library_type
     applies_to: any
     default: whl_workspace_file
     bounds:
-      in_scope: [whl_workspace_file]
+      in_scope: [none, whl_workspace_file]
     status: pending
-    evidence: "real bundles show internal utility modules (e.g. shared helpers, credential/secret-handling folders) far more often than external package declarations; external dependency field in one export source was found unreliable and excluded"
+    evidence: >
+      Real bundles show internal utility modules (shared helpers, credential/secret-handling
+      folders) far more often than external package declarations. Confirmed library forms in
+      the corpus: a real wheel shipped inside a bundle (dataos_splunk-1.0.15-py3-none-any.whl
+      in dps_workflow/notebooks/common), a full setup.py + versioned package
+      (dps_etl_utils_lib with etl_utils package, requirements.txt, version.txt), and
+      egg-style shared packages (common_utils_egg imported via python_import in
+      pipeline_engine). CANDIDATE VALUES NOT YET IN SCOPE: egg/setup.py-installed packages
+      and jar dependencies both occur in real code but are not modeled by generation yet —
+      documented here so their absence is a recorded decision, not an oversight. The
+      dependent_libraries CSV column is empty/error in both newer exports (extraction bug),
+      so library-form PROPORTIONS remain unquantifiable; only existence is confirmed.
+      "none" stays in scope: table-focused scenarios (e.g. Liquid Clustering) legitimately
+      carry no library at all.
 
   - dimension: environment_naming
     applies_to: any
     default: null
     status: pending
-    evidence: "multiple inconsistent spellings of the same logical environment concept observed across real parameter payloads; candidate distractor/edge-case source, not yet a default"
+    evidence: >
+      Multiple inconsistent spellings of the same logical environment concept observed
+      across real parameter payloads — candidate distractor/edge-case source, not a
+      default. Now substantially enriched by the dev corpus: job names carry environment
+      suffixes -dev / -stage / -itg / -daily (10/23/2/13 in the dev slice), workspace paths
+      embed blue/green deployment slots (/stage/gbd-lf-processor/blue/workflow/...,
+      /daily/.../green/workflow/...), and the same job commonly exists as parallel -stage
+      and -daily variants. Blue/green slot paths and env-suffixed job-name pairs are
+      first-class distractor material: they look meaningful to a naive matcher but carry
+      no compatibility signal.
+
+  - dimension: environment_version_profile
+    applies_to: any
+    default: unset
+    status: pending
+    evidence: >
+      DBR runtime pinning is a loud, real dimension in this estate: 11.3.x, 13.3.x, 14.2.x,
+      14.3.x, and 15.4.x all present across the DataOS corpus (14.3.x most common at 20/80).
+      Directly relevant to serverless-migration realism — an 11.3-pinned job is a different
+      migration story than a 15.4 one. Kept default unset (generation does not pin a runtime
+      unless asked) but recorded so scenario prompts CAN exercise version-pinned cases and
+      the spread of plausible values is documented.
+
+  - dimension: language
+    applies_to: any
+    default: python
+    bounds:
+      in_scope: [python, sql]
+    status: pending
+    evidence: >
+      Generation is Python/SQL-only today, and that matches the dominant reality (DataOS
+      classification: 70 pyspark / 10 python out of 80). HOWEVER: real bundles contain
+      Scala modules alongside Python — Scala source confirmed in udm-printer dependencies
+      (val schema = ..., .rdd.map(r => ...) in notebooks/common/lib) and aa-supplyjournal
+      (Schema_Compare with emptyRDD[Row]). Scala is deliberately out of generation scope
+      for now; this entry exists so that decision is recorded and reviewable, and so the
+      serverless feature's non_python_sql_language signal is understood to fire on real,
+      current client code — not a hypothetical.
 
 # =====================================================================
 # FEATURE SCOPE — which registered features (from the grammar's
@@ -204,6 +312,23 @@ the distinction is the entire point of tracking it.
 observed, not a value to aim for by default — the `default` field is the typical case,
 `bounds` exists only to catch requests that would generate something never seen in this
 client's real estate.
+
+**The production shape to aim for, in one paragraph.** A typical generated job should look
+like: one entry notebook named like a wrapper/orchestrator, opening with a
+dbutils.widgets.removeAll() + widgets.text/get parameter preamble, navigating to one or
+two child notebooks via %run (occasionally dbutils.notebook.run — roughly 1-in-50, not
+1-in-2), importing one or more distinct utility modules directly via python_import where
+their logic is used, backed by an internal wheel when a library is called for, scheduled
+daily via cron with a timezone, and living under a path that carries an environment suffix
+and possibly a blue/green slot. That composite sentence is what all three data packages
+agree on.
+
+**What this file deliberately does NOT model, as recorded decisions.** Repository-level
+operational sprawl (playbooks, monitoring configs, batch lists — dps_workflow's 339 files
+are repo accumulation, not per-job structure; generation models the JOB unit); Scala
+modules (real, present, out of scope — see the language entry); egg/setup.py and jar
+library forms (real, present, candidates — see library_type). Each absence is a decision
+with an evidence trail, not a blind spot.
 
 **When a feature has no scope entry at all.** Generate anyway, using that feature's own skill
 defaults, and flag it. Absence here is a coverage gap to close later, not a reason to refuse

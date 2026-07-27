@@ -623,6 +623,30 @@ materialization_contract:
       rule: "The materializer reads the plan and nothing else. No re-planning, no defaults invented here."
     - id: edges_must_resolve
       rule: "Every rendered reference must point at a path that exists in the emitted artifact set."
+    - id: widgets_preamble
+      rule: >
+        When knobs.param_passing is widgets, the entry notebook opens with the client's
+        canonical parameter preamble: dbutils.widgets.removeAll(), then a
+        widgets.text(name, "") / widgets.get(name) pair per declared parameter, BEFORE any
+        edge rendering or business logic. Parameters come from the plan's asset/param
+        declarations; if none are declared, render a small representative set. Evidence:
+        this preamble is the single most consistent pattern in the client's real entry
+        notebooks (~237 dbutils.widgets occurrences across three sampled bundles).
+    - id: schedule_block
+      rule: >
+        When the plan's job_trigger resolves to schedule, databricks.yml's job carries a
+        schedule block with a Quartz cron expression and an explicit timezone_id, matching
+        the client's observed form ("13 0 7 * * ?" + America/Los_Angeles). manual renders
+        no schedule block at all. Other trigger kinds (file_arrival, table_update,
+        continuous) remain vocabulary-valid but are not yet rendered — a plan resolving to
+        one of them must be flagged, not silently rendered as manual.
+    - id: job_unit_scope
+      rule: >
+        Generated bundles model the JOB unit — one job's entry notebook, children, modules,
+        and library — never the repository unit. Real client repos accumulate hundreds of
+        operational files (playbooks, monitoring configs, batch lists) around their jobs;
+        that sprawl is deliberately out of scope, and a size gap between a generated bundle
+        and a real repo is expected, not a fidelity failure.
     - id: distractors_rendered_inert
       rule: "Planted distractors are rendered on their declared surface only and must not be executable."
     - id: stamp_everything

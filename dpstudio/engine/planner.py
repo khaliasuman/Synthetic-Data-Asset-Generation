@@ -82,6 +82,16 @@ YOUR JOB, IN ORDER:
     this is a real, previously-confirmed defect. If library_type is "none", do not
     create a library_src node at all.
 
+2e. Parameterization and trigger, per client-dna. When client-dna sets
+    param_passing default widgets (and the request doesn't override), set
+    knobs.param_passing to "widgets" and knobs.param_names to a SHORT list (2-5)
+    of realistic parameter names for this scenario (e.g. catalog, schema,
+    receive_date, secret_name) -- the materializer renders the client's canonical
+    widgets.removeAll()/text/get preamble from these; do NOT write widget lines in
+    node_code yourself. When client-dna sets job_trigger default schedule, set
+    knobs.job_trigger to "schedule" -- the materializer renders the cron+timezone
+    block; do NOT invent schedule YAML in node_code or notes.
+
 2b. table_physical fields are MUTUALLY EXCLUSIVE per the feature skill's own rules --
     check each feature skill's eligibility_signals and apply_rules for constraint pairs
     (e.g. a table cannot have both partition_by AND cluster_by set at once; ZORDER and

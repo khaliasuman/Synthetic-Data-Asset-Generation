@@ -74,12 +74,26 @@ signals:
     match:
       any_pattern:
         - "SparkContext"
+        - "sparkContext"
         - "\\bsc\\.\\w"
         - "\\.rdd\\b"
         - "\\bparallelize\\("
+        - "emptyRDD"
+        - "defaultParallelism"
         - "mapPartitions|foreachPartition"
         - "hadoopConfiguration"
         - "setJobGroup|setLocalProperty"
+    evidence_note: >
+      Not hypothetical: confirmed in current HP production code. Real occurrences found in
+      the dev-corpus bundles include spark.sparkContext.parallelize([]) (udm-printer
+      workflow/printer_model line ~280), spark.sparkContext.emptyRDD[Row] (aa-supplyjournal
+      Schema_Compare), spark.sparkContext.getConf().getAll() and
+      spark.sparkContext.defaultParallelism (aa-supplyjournal includes/UtilsMisc), and
+      .rdd.map(...) in Scala helper code. These are live jobs that would genuinely block on
+      serverless migration today. Pattern-matching is CASE-SENSITIVE in the oracle, so the
+      lowercase "sparkContext" attribute-access form (the most common real-world spelling)
+      and the emptyRDD/defaultParallelism forms each need their own pattern — the original
+      list matched none of the three getConf/defaultParallelism/emptyRDD occurrences above.
     why: >
       Serverless runs Spark Connect exclusively. There is no client-visible
       SparkContext and no RDD API; only the DataFrame / Spark SQL surface exists.

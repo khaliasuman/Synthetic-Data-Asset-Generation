@@ -28,9 +28,24 @@ def _render_notebook(plan: dict, node_id: str) -> str:
     pid, pver = plan["plan_id"], plan["plan_version"]
     edges = [e for e in plan["code_graph"]["edges"] if e["from_node"] == node_id]
     node_path = {n["node_id"]: f"./{n['node_id']}" for n in plan["code_graph"]["nodes"]}
+    roles = {n["node_id"]: n.get("role") for n in plan["code_graph"]["nodes"]}
 
     lines = ["# Databricks notebook source", f"# plan_id: {pid}  plan_version: {pver}",
               "# COMMAND ----------"]
+
+    # Widgets preamble -- the client's canonical entry-notebook opening (grammar
+    # materialization_contract rule widgets_preamble). Entry nodes only; children
+    # receive values via their caller, matching real bundles.
+    if (roles.get(node_id) == "entry"
+            and plan.get("knobs", {}).get("param_passing") == "widgets"):
+        params = plan.get("knobs", {}).get("param_names") or [
+            "catalog", "schema", "receive_date"]
+        lines += ["dbutils.widgets.removeAll()", "# COMMAND ----------"]
+        for p in params:
+            lines.append(f'dbutils.widgets.text("{p}", "")')
+            lines.append(f'{p} = dbutils.widgets.get("{p}")')
+        lines.append("# COMMAND ----------")
+
     for d in plan.get("distractors", []):
         if d["node_id"] == node_id and d["surface"] == "markdown_cell":
             lines += ["# MAGIC %md", f"# MAGIC {d.get('text', d['imitates_signal'])}",
@@ -80,6 +95,21 @@ def _render_bundle_yaml(plan: dict, whl_name: str | None) -> str:
                 f"          spec:\n            dependencies:\n"
                 f"              - /Volumes/main/synth_studio/libs/{whl_name}\n"
                 if whl_name else "")
+
+    # Schedule block (grammar materialization_contract rule schedule_block):
+    # when the plan resolves job_trigger=schedule, emit a Quartz cron + timezone
+    # in the client's observed form. Vary the minute/hour deterministically from
+    # plan_id so generated jobs don't all share one identical schedule.
+    trigger = (plan.get("knobs", {}).get("job_trigger")
+               or (plan.get("assets") or [{}])[0].get("job_trigger"))
+    sched_line = ""
+    if trigger == "schedule":
+        h = int(hashlib.md5(pid.encode()).hexdigest(), 16)
+        minute, hour = h % 60, h // 60 % 24
+        sched_line = (f"      schedule:\n"
+                      f"        quartz_cron_expression: \"0 {minute} {hour} * * ?\"\n"
+                      f"        timezone_id: America/Los_Angeles\n")
+
     return f"""# plan_id: {pid}  plan_version: {pver}  (generated {datetime.now(timezone.utc).isoformat()})
 bundle:
   name: synthetic_{pid}
@@ -92,7 +122,7 @@ resources:
         plan_id: {pid}
         plan_version: "{pver}"
         scenario_type: {plan.get('scenario_type', 'positive')}
-      tasks:
+{sched_line}      tasks:
         - task_key: main_task
           notebook_task:
             notebook_path: ./src/notebooks/{entry}.py
