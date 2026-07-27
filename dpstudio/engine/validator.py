@@ -74,6 +74,38 @@ def run(plan: dict, out_dir: str | Path) -> list[tuple[str, bool, str]]:
               f"code_graph node has role='library_src' -- the plan claims a library "
               f"exists but nothing will be materialized for it.")
 
+    # A declared widget parameter that never appears in any node's executable code
+    # is decoration, not a real parameter -- confirmed as a real defect (e.g.
+    # lookback_days declared via dbutils.widgets but never referenced anywhere).
+    param_names = plan.get("knobs", {}).get("param_names") or []
+    if param_names:
+        all_code = "\n".join(
+            line for nc in plan.get("_node_code", {}).values()
+            for line in nc.get("executable", [])
+        )
+        unused = [p for p in param_names if p not in all_code]
+        check("declared_params_are_used", not unused,
+              f"knobs.param_names includes {unused} but these never appear in any "
+              f"node's executable code beyond their own widget declaration.")
+
+    # A table_physical field that should be numeric (per the grammar's declared
+    # table_physical_keys) but resolved to a non-numeric shape (e.g. a nested
+    # dict) will silently fail to match any oracle threshold rather than crash --
+    # confirmed live as a real, if rare, planner malformation. Surface it here so
+    # it's a visible plan defect rather than a quietly-skipped signal.
+    NUMERIC_TABLE_PHYSICAL_FIELDS = {
+        "partition_count", "avg_partition_row_count", "small_file_count",
+        "avg_file_size_mb", "skew_factor", "target_file_size",
+        "has_filtered_column_with_cardinality", "total_row_count", "scanned_bytes_gb",
+    }
+    for asset in plan.get("assets", []):
+        tp = asset.get("table_physical", {}) or {}
+        malformed = [k for k in NUMERIC_TABLE_PHYSICAL_FIELDS
+                    if k in tp and not isinstance(tp[k], (int, float))]
+        check("table_physical_numeric_fields_well_typed", not malformed,
+              f"table_physical fields {malformed} should be numeric but resolved "
+              f"to a non-numeric value: {[tp[k] for k in malformed]!r}")
+
     if plan.get("scenario_type") == "negative":
         check("negative_scenario_has_injected_signal",
               bool(plan["expected"]["matched_signals"]), "no signals matched")

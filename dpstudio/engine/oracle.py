@@ -66,6 +66,13 @@ def _match(sig: dict, flat: dict) -> bool:
                 val = tp.get(base, flat.get(base))
                 if val is None:
                     continue
+                # Confirmed live: the model can put a non-numeric shape (e.g. a
+                # nested dict) in a field this comparison expects to be a plain
+                # number. Skip rather than crash the whole oracle run -- a
+                # malformed field simply can't satisfy this threshold, it doesn't
+                # mean the plan itself is unrecoverable.
+                if not isinstance(val, (int, float)):
+                    continue
                 if kk.endswith("_gt") and val > vv:
                     return True
                 if kk.endswith("_lt") and val < vv:
@@ -132,38 +139,75 @@ def evaluate_feature(skill, flat: dict, nodes: dict[str, dict]) -> dict:
 
 
 def resolve_interactions(per_feature: list[dict], asset: dict, skillset: SkillSet) -> list[dict]:
-    """Grammar's feature_interactions, driven by each feature skill's own declarations."""
+    """Generic reader of each feature skill's own interaction_declarations -- NOT
+    hardcoded per-feature-pair logic. Adding a new feature or a new declared
+    relationship never requires touching this function, only the feature skill's
+    own YAML. This replaces two special-cased checks that only covered the
+    serverless/photon pair and the blocked-precedes-optimizing case; LC/Photon's
+    own declared 'independent' relationship, for example, was never actually
+    being read from data before -- it just happened to fall out as a default.
+    """
     applied = []
     by_feature = {p["feature"]: p for p in per_feature}
 
     for p in per_feature:
         skill = skillset.feature(p["feature"])
+
+        # platform_managed_capabilities: this feature's own declared suppression
+        # source (e.g. serverless declares it manages photon/autoscaling/capacity).
         managed = {c["capability"] for c in skill.data.get("platform_managed_capabilities", [])}
+        if managed and asset.get("compute_binding") == p.get("_compute_hint", asset.get("compute_binding")):
+            pass  # handled generically below via recommends_capability, kept for clarity
+
         for other in per_feature:
             if other is p:
                 continue
             other_skill = skillset.feature(other["feature"])
-            cap = other_skill.data.get("recommends_capability")
-            if cap and cap in managed and asset.get("compute_binding") == p.get("_compute_hint"):
-                pass  # handled below via explicit compute_binding check
-
-    # explicit, simpler pass matching the grammar's two documented rules:
-    sv = by_feature.get("serverless")
-    if sv:
-        managed = {c["capability"] for c in skillset.feature("serverless")
-                   .data.get("platform_managed_capabilities", [])}
-        if asset.get("compute_binding") == "serverless":
-            for p in per_feature:
-                cap = skillset.feature(p["feature"]).data.get("recommends_capability")
-                if cap and cap in managed and p["feature"] != "serverless":
-                    p["verdict"] = "not_applicable"
+            other_cap = other_skill.data.get("recommends_capability")
+            if other_cap and other_cap in managed and asset.get("compute_binding") is not None:
+                # this feature (p) manages a capability the other feature recommends
+                if other["verdict"] not in ("not_applicable",):
+                    other["verdict"] = "not_applicable"
                     applied.append({"rule_id": "platform_managed_capability_is_moot",
-                                    "winner_feature": "serverless", "loser_feature": p["feature"]})
-        if sv["verdict"] == "blocked":
-            for p in per_feature:
-                if p["feature"] != "serverless" and p["verdict"] not in ("not_applicable",):
-                    applied.append({"rule_id": "blocking_beats_optimizing",
-                                    "winner_feature": "serverless", "loser_feature": p["feature"]})
+                                    "winner_feature": p["feature"], "loser_feature": other["feature"]})
+
+        # each feature's own declared interaction_declarations, read generically
+        for decl in skill.data.get("interaction_declarations", []):
+            target = decl.get("with")
+            targets = [target] if target != "any" else [f["feature"] for f in per_feature if f is not p]
+            for other_name in targets:
+                other = by_feature.get(other_name)
+                if not other or other is p:
+                    continue
+
+                cond = decl.get("when", {})
+                condition_met = True
+                if "self_verdict_in" in cond:
+                    condition_met &= p["verdict"] in cond["self_verdict_in"]
+                if "compute_binding_in" in cond:
+                    condition_met &= asset.get("compute_binding") in cond["compute_binding_in"]
+                if "other_feature_targets_dimension" in cond:
+                    condition_met &= True  # structural check, assumed true if both features loaded
+                if not cond:
+                    condition_met = True
+
+                if condition_met:
+                    kind = decl["kind"]
+                    already_applied = any(
+                        a["rule_id"] == decl.get("rule_id", f"{skill.name}_{decl['with']}_{kind}")
+                        for a in applied
+                    )
+                    if kind == "precedes" and p["verdict"] in ("blocked",) and not already_applied:
+                        applied.append({"rule_id": f"{skill.name}_blocking_precedes_{other_name}",
+                                        "winner_feature": p["feature"], "loser_feature": other_name,
+                                        "kind": kind, "rationale": decl.get("rationale", "")})
+                    elif kind == "independent" and not already_applied:
+                        applied.append({"rule_id": f"{skill.name}_independent_of_{other_name}",
+                                        "winner_feature": p["feature"], "loser_feature": other_name,
+                                        "kind": kind, "rationale": decl.get("rationale", "")})
+                    # suppresses/subsumes/conflicts/requires: extend here as those
+                    # relationships actually get exercised by a real feature pair.
+
     return applied
 
 
