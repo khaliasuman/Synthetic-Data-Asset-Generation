@@ -1,28 +1,71 @@
 """
 dpstudio/engine/llm.py
 
-Thin wrapper around Databricks' Foundation Model API (Mosaic AI Model Serving).
-Used instead of calling api.anthropic.com directly, because Free Edition
-restricts outbound internet to a trusted-domain allowlist -- the Foundation
-Model API is served from inside the Databricks control plane, so no external
-egress is needed.
-
-Uses the OpenAI-compatible client, which Databricks Model Serving supports
-natively. Endpoint name must be verified in YOUR workspace's Serving tab --
-it varies by workspace/region and changes over time, so don't hardcode a
-model string without checking.
+Thin wrappers for the LLM calls this pipeline makes, plus lightweight
+observability: every call's latency, token counts, and estimated cost are
+recorded, since the planner call is both the most expensive and the least
+reliable step in the pipeline and is the natural target for a future
+architectural shift (deterministic composition, LLM only for intent + content).
 """
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+
+# Rough public per-MTok rates for observability only -- not billing-accurate,
+# just enough to compare approaches/models directionally. Update as needed.
+_COST_PER_MTOK = {
+    "claude-sonnet-4-5": {"input": 3.0, "output": 15.0},
+    "claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0},
+}
 
 
 @dataclass
 class LLMResponse:
     text: str
     raw: dict
+
+
+@dataclass
+class CallLog:
+    """One entry per LLM call. Append to CALL_LOG for the lifetime of a session;
+    a UI or notebook can read this directly for a running cost/latency view."""
+    model: str
+    latency_s: float
+    input_tokens: int
+    output_tokens: int
+    estimated_cost_usd: float
+
+
+CALL_LOG: list[CallLog] = []
+
+
+def _record(model: str, latency_s: float, input_tokens: int, output_tokens: int) -> CallLog:
+    rates = _COST_PER_MTOK.get(model, {"input": 0.0, "output": 0.0})
+    cost = (input_tokens / 1_000_000) * rates["input"] + (output_tokens / 1_000_000) * rates["output"]
+    entry = CallLog(model=model, latency_s=latency_s, input_tokens=input_tokens,
+                    output_tokens=output_tokens, estimated_cost_usd=cost)
+    CALL_LOG.append(entry)
+    return entry
+
+
+def session_summary() -> dict:
+    """Quick aggregate view -- total calls, latency, tokens, cost this session."""
+    if not CALL_LOG:
+        return {"calls": 0}
+    return {
+        "calls": len(CALL_LOG),
+        "total_latency_s": round(sum(c.latency_s for c in CALL_LOG), 2),
+        "total_input_tokens": sum(c.input_tokens for c in CALL_LOG),
+        "total_output_tokens": sum(c.output_tokens for c in CALL_LOG),
+        "total_estimated_cost_usd": round(sum(c.estimated_cost_usd for c in CALL_LOG), 4),
+        "by_model": {
+            m: {"calls": sum(1 for c in CALL_LOG if c.model == m),
+                "cost_usd": round(sum(c.estimated_cost_usd for c in CALL_LOG if c.model == m), 4)}
+            for m in {c.model for c in CALL_LOG}
+        },
+    }
 
 
 class DatabricksLLM:
@@ -103,6 +146,7 @@ class AnthropicLLM:
 
     def complete(self, system: str, user: str, max_tokens: int = 2000,
                  temperature: float = 0.0) -> LLMResponse:
+        t0 = time.time()
         resp = self._client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
@@ -110,6 +154,8 @@ class AnthropicLLM:
             system=system,
             messages=[{"role": "user", "content": user}],
         )
+        latency = time.time() - t0
+        _record(self.model, latency, resp.usage.input_tokens, resp.usage.output_tokens)
         # Anthropic responses are a list of content blocks; take the text ones.
         text = "".join(b.text for b in resp.content if b.type == "text")
         return LLMResponse(text=text, raw=resp.model_dump())
