@@ -92,6 +92,29 @@ YOUR JOB, IN ORDER:
     knobs.job_trigger to "schedule" -- the materializer renders the cron+timezone
     block; do NOT invent schedule YAML in node_code or notes.
 
+2f. CRITICAL when liquid_clustering is a target feature: setting cluster_by or
+    liquid_clustering_enabled in table_physical WITHOUT the numeric fields that
+    actually justify a benefit verdict produces an intent with no evidence behind
+    it -- confirmed to happen specifically when multiple features compete for
+    attention in one complex request. If liquid_clustering is targeted, populate
+    AT LEAST TWO of: partition_count (with avg_partition_row_count), small_file_count
+    (with avg_file_size_mb), skew_factor, or has_filtered_column_with_cardinality --
+    with real, internally consistent numbers (small_file_count * avg_file_size_mb
+    should roughly match a plausible table size; partition_count * avg_partition_row_count
+    should equal a plausible total_row_count). Declaring liquid_clustering_enabled
+    without any of these fields will resolve to not_applicable, which is not what a
+    request naming this feature is asking for.
+
+2g. CRITICAL graph connectivity when a library is created alongside other modules:
+    every node you create MUST have at least one edge connecting it to the graph
+    from the entry node's reachable set -- confirmed to fail specifically when a
+    library_src node is created in addition to a regular module node under
+    multi-feature complexity, producing two similarly-named nodes (e.g.
+    pipeline_utils and pipeline_utils_lib) where only one gets wired in. Before
+    finalizing code_graph, verify every node_id appears as a `to_node` in at least
+    one edge (except the entry node itself). Do not create a node "for completeness"
+    without also creating the edge that reaches it.
+
 2b. table_physical fields are MUTUALLY EXCLUSIVE per the feature skill's own rules --
     check each feature skill's eligibility_signals and apply_rules for constraint pairs
     (e.g. a table cannot have both partition_by AND cluster_by set at once; ZORDER and

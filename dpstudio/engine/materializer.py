@@ -157,8 +157,55 @@ def _strip_duplicated_reference_lines(plan: dict) -> dict:
     return plan
 
 
+def _connect_orphaned_nodes(plan: dict) -> dict:
+    """Deterministically wires an edge from the entry node to any node the graph
+    left unreachable, rather than only flagging it via graph_well_formed.
+
+    Confirmed as a real, live bug: under multi-feature complexity (3 features
+    targeted in one prompt), the planner created a library_src node alongside a
+    similarly-named module node (pipeline_utils / pipeline_utils_lib) and only
+    wired one of them in. The orphan is real, intended content -- not dead
+    weight to discard -- so the fix is to connect it (python_import, since that's
+    always a safe/valid mechanism regardless of node role) rather than delete it.
+    """
+    graph = plan.get("code_graph", {})
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    if not nodes:
+        return plan
+
+    entry = next((n["node_id"] for n in nodes if n.get("role") == "entry"), None)
+    if not entry:
+        return plan
+
+    reachable = {entry}
+    frontier = [entry]
+    while frontier:
+        cur = frontier.pop()
+        for e in edges:
+            if e["from_node"] == cur and e["to_node"] not in reachable:
+                reachable.add(e["to_node"])
+                frontier.append(e["to_node"])
+
+    orphaned = [n["node_id"] for n in nodes if n["node_id"] not in reachable]
+    if orphaned:
+        for node_id in orphaned:
+            edges.append({"from_node": entry, "to_node": node_id,
+                          "reference_mechanism": "python_import"})
+        plan.setdefault("plan_notes", "")
+        plan["plan_notes"] = (
+            f"{plan['plan_notes']} connect_orphaned_nodes: added python_import edges "
+            f"from {entry} to {orphaned} -- these nodes existed in the graph but had "
+            f"no edge reaching them."
+        ).strip()
+        graph["edges"] = edges
+
+    return plan
+
+
 def materialize(plan: dict, out_dir: str | Path) -> dict:
     plan = _strip_duplicated_reference_lines(plan)
+    plan = _connect_orphaned_nodes(plan)
     out_dir = Path(out_dir)
     (out_dir / "src" / "notebooks").mkdir(parents=True, exist_ok=True)
     (out_dir / "src" / "sql").mkdir(parents=True, exist_ok=True)
