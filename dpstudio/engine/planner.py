@@ -115,6 +115,33 @@ YOUR JOB, IN ORDER:
     one edge (except the entry node itself). Do not create a node "for completeness"
     without also creating the edge that reaches it.
 
+2h. CRITICAL every declared widget param must actually be used. Confirmed as a real
+    defect: knobs.param_names sometimes lists a parameter (e.g. lookback_days) that
+    is declared via dbutils.widgets.text/get in the entry notebook but never
+    referenced again anywhere -- a widget nobody reads is a decoration, not a real
+    parameter, and it's exactly the kind of thing a reviewer notices immediately.
+    Every name in knobs.param_names MUST appear in at least one node's
+    node_code.executable line, used meaningfully (a filter predicate, a path
+    component, a conditional, a log line) -- not just re-assigned and dropped. If
+    you cannot think of a real use for a parameter, do not declare it in the first
+    place; a shorter, fully-used param list is better than a longer decorative one.
+
+2i. Realism floor for node_code, since production code this thin is a visible
+    synthetic tell to any real reviewer. Within the same 1-4 line budget per node,
+    prefer lines that carry real signal over lines that are purely narrative:
+    - The entry/orchestrator node should wrap its core action in a minimal
+      try/except, calling dbutils.notebook.exit("FAILED: <reason>") or raising on
+      failure -- not silently succeeding regardless of outcome.
+    - At least one data-loading node should include a basic null/quality check
+      (e.g. .filter(col(...).isNotNull()) or an explicit row-count assertion)
+      rather than reading and writing with no validation at all.
+    - Prefer a real log line (print or a logger call carrying an actual variable,
+      e.g. row count or a computed value) over a static narrative string with
+      nothing computed in it.
+    This is a floor, not a rewrite -- still short, still 1-4 lines per node, just
+    lines that would survive a senior engineer's glance rather than reading as
+    obviously synthetic filler.
+
 2b. table_physical fields are MUTUALLY EXCLUSIVE per the feature skill's own rules --
     check each feature skill's eligibility_signals and apply_rules for constraint pairs
     (e.g. a table cannot have both partition_by AND cluster_by set at once; ZORDER and
