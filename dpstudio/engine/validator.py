@@ -59,6 +59,23 @@ def run(plan: dict, out_dir: str | Path) -> list[tuple[str, bool, str]]:
                 dupe_ref_lines.append((nid, line.strip()))
     check("no_duplicated_reference_mechanism", not dupe_ref_lines, str(dupe_ref_lines))
 
+    # When knobs.param_passing is "widgets", the materializer auto-injects the
+    # widgets.removeAll()/text()/get() preamble for the entry node -- node_code
+    # should NEVER contain literal widget-declaration lines itself, the same
+    # invariant as reference-mechanism lines belonging only to edges. Confirmed
+    # live comparing Haiku vs Sonnet output on an identical prompt: Haiku's
+    # node_code wrote its own widget block IN ADDITION to the materializer's
+    # auto-injected one, producing a duplicate in the rendered notebook -- and
+    # the duplicate was itself broken (assigning .text()'s return, which is
+    # None, instead of calling .get() to retrieve the value).
+    dupe_widget_lines = []
+    if plan.get("knobs", {}).get("param_passing") == "widgets":
+        for nid, node_code in plan.get("_node_code", {}).items():
+            for line in node_code.get("executable", []):
+                if "widgets.removeAll" in line or "widgets.text(" in line:
+                    dupe_widget_lines.append((nid, line.strip()))
+    check("no_duplicated_widget_declaration", not dupe_widget_lines, str(dupe_widget_lines))
+
     # A library_type knob claiming a real library exists ("whl_workspace_file")
     # with library_count >= 1 must be backed by an actual library_src node in the
     # graph -- otherwise the plan claims a dependency that never gets materialized.

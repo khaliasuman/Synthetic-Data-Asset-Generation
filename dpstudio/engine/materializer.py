@@ -2,7 +2,7 @@
 dpstudio/engine/materializer.py
 
 Reads ONLY the plan (plan_only_input, per the grammar's materialization_contract).
-Writes real notebooks, builds a real wheel from generated source, writes a
+Writes real notebooks, builds a real wheel from generated source, writes a 
 databricks.yml, and stamps plan_id into every artifact. No LLM call.
 """
 from __future__ import annotations
@@ -132,26 +132,34 @@ resources:
 
 def _strip_duplicated_reference_lines(plan: dict) -> dict:
     """Deterministically removes any literal magic_run/dbutils_notebook_run line
-    from a node's executable code. Those mechanisms are declared once via
-    code_graph.edges and rendered by _render_notebook -- a literal copy in
-    executable code is always a planner duplication, never intentional content.
+    from a node's executable code, AND any literal widget-declaration line when
+    the materializer already auto-injects the widgets preamble. Both mechanisms
+    are declared once via the plan itself (code_graph.edges for references,
+    knobs.param_passing for widgets) and rendered separately -- a literal copy
+    in executable code is always a planner duplication, never intentional
+    content.
 
     Promoted from instruction-only (planner.py) to a code guarantee after the
-    instruction failed a second time on a different scenario shape (a
-    library-backed pipeline) than the one it was originally fixed against.
-    Same escalation pattern as normalize_table_physical.
+    reference-mechanism instruction failed a second time on a different
+    scenario shape, and the widget variant was confirmed live comparing Haiku
+    vs Sonnet output on an identical prompt -- Haiku wrote its own widget block
+    in addition to the materializer's auto-injected one, and the duplicate was
+    itself broken code (assigning .text()'s return instead of calling .get()).
     """
+    widgets_mode = plan.get("knobs", {}).get("param_passing") == "widgets"
     for node_id, node_code in plan.get("_node_code", {}).items():
         executable = node_code.get("executable", [])
         cleaned = [line for line in executable
-                  if "%run " not in line and "dbutils.notebook.run(" not in line]
+                  if "%run " not in line and "dbutils.notebook.run(" not in line
+                  and not (widgets_mode and ("widgets.removeAll" in line or "widgets.text(" in line))]
         if len(cleaned) != len(executable):
             removed = [l for l in executable if l not in cleaned]
             plan.setdefault("plan_notes", "")
             plan["plan_notes"] = (
                 f"{plan['plan_notes']} strip_duplicated_reference_lines: removed "
                 f"{removed} from node {node_id} -- already rendered via a "
-                f"code_graph edge, duplicate literal line discarded."
+                f"code_graph edge or the widgets preamble, duplicate literal "
+                f"line discarded."
             ).strip()
             node_code["executable"] = cleaned
     return plan
