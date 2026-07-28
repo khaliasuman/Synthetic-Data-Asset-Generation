@@ -35,17 +35,30 @@ class CallLog:
     latency_s: float
     input_tokens: int
     output_tokens: int
+    cache_creation_tokens: int
+    cache_read_tokens: int
     estimated_cost_usd: float
 
 
 CALL_LOG: list[CallLog] = []
 
 
-def _record(model: str, latency_s: float, input_tokens: int, output_tokens: int) -> CallLog:
+def _record(model: str, latency_s: float, input_tokens: int, output_tokens: int,
+           cache_creation_tokens: int = 0, cache_read_tokens: int = 0) -> CallLog:
     rates = _COST_PER_MTOK.get(model, {"input": 0.0, "output": 0.0})
-    cost = (input_tokens / 1_000_000) * rates["input"] + (output_tokens / 1_000_000) * rates["output"]
+    # Cache write costs 1.25x normal input rate (one-time, first call after a skill
+    # file changes); cache read costs 0.1x normal input rate (every call within the
+    # ~5-minute cache window that reuses the same static prefix). Uncached input
+    # (e.g. varying feature-skill blocks not yet cached) bills at the normal rate.
+    cost = (
+        (input_tokens / 1_000_000) * rates["input"]
+        + (cache_creation_tokens / 1_000_000) * rates["input"] * 1.25
+        + (cache_read_tokens / 1_000_000) * rates["input"] * 0.1
+        + (output_tokens / 1_000_000) * rates["output"]
+    )
     entry = CallLog(model=model, latency_s=latency_s, input_tokens=input_tokens,
-                    output_tokens=output_tokens, estimated_cost_usd=cost)
+                    output_tokens=output_tokens, cache_creation_tokens=cache_creation_tokens,
+                    cache_read_tokens=cache_read_tokens, estimated_cost_usd=cost)
     CALL_LOG.append(entry)
     return entry
 
@@ -54,11 +67,16 @@ def session_summary() -> dict:
     """Quick aggregate view -- total calls, latency, tokens, cost this session."""
     if not CALL_LOG:
         return {"calls": 0}
+    total_cache_read = sum(c.cache_read_tokens for c in CALL_LOG)
+    total_input_all = sum(c.input_tokens + c.cache_creation_tokens + c.cache_read_tokens for c in CALL_LOG)
     return {
         "calls": len(CALL_LOG),
         "total_latency_s": round(sum(c.latency_s for c in CALL_LOG), 2),
         "total_input_tokens": sum(c.input_tokens for c in CALL_LOG),
         "total_output_tokens": sum(c.output_tokens for c in CALL_LOG),
+        "total_cache_creation_tokens": sum(c.cache_creation_tokens for c in CALL_LOG),
+        "total_cache_read_tokens": total_cache_read,
+        "cache_hit_rate": round(total_cache_read / total_input_all, 3) if total_input_all else 0.0,
         "total_estimated_cost_usd": round(sum(c.estimated_cost_usd for c in CALL_LOG), 4),
         "by_model": {
             m: {"calls": sum(1 for c in CALL_LOG if c.model == m),
@@ -119,7 +137,7 @@ class DatabricksLLM:
             text = content
         return LLMResponse(text=text, raw=resp.model_dump())
 
-    def complete_json(self, system: str, user: str, max_tokens: int = 2000) -> dict:
+    def complete_json(self, system: str | list[dict], user: str, max_tokens: int = 2000) -> dict:
         """Calls complete() and parses the result as JSON, stripping code fences
         if the model wraps its output in ```json ... ``` despite instructions not to."""
         r = self.complete(system, user, max_tokens=max_tokens)
@@ -144,8 +162,12 @@ class AnthropicLLM:
         self._client = anthropic.Anthropic(api_key=api_key)
         self.model = model
 
-    def complete(self, system: str, user: str, max_tokens: int = 2000,
+    def complete(self, system: str | list[dict], user: str, max_tokens: int = 2000,
                  temperature: float = 0.0) -> LLMResponse:
+        """system accepts either a plain string (unchanged, no caching) or a list
+        of content blocks with cache_control markers for prompt caching, e.g.:
+            [{"type": "text", "text": STATIC_CONTENT, "cache_control": {"type": "ephemeral"}}]
+        The Anthropic SDK accepts both forms natively for the `system` parameter."""
         t0 = time.time()
         resp = self._client.messages.create(
             model=self.model,
@@ -155,12 +177,15 @@ class AnthropicLLM:
             messages=[{"role": "user", "content": user}],
         )
         latency = time.time() - t0
-        _record(self.model, latency, resp.usage.input_tokens, resp.usage.output_tokens)
+        cache_read = getattr(resp.usage, "cache_read_input_tokens", 0) or 0
+        cache_created = getattr(resp.usage, "cache_creation_input_tokens", 0) or 0
+        _record(self.model, latency, resp.usage.input_tokens, resp.usage.output_tokens,
+               cache_created, cache_read)
         # Anthropic responses are a list of content blocks; take the text ones.
         text = "".join(b.text for b in resp.content if b.type == "text")
         return LLMResponse(text=text, raw=resp.model_dump())
 
-    def complete_json(self, system: str, user: str, max_tokens: int = 2000) -> dict:
+    def complete_json(self, system: str | list[dict], user: str, max_tokens: int = 2000) -> dict:
         r = self.complete(system, user, max_tokens=max_tokens)
         text = r.text.strip()
         if text.startswith("```"):
@@ -176,7 +201,7 @@ class StubLLM:
     def __init__(self, canned: dict[str, dict]):
         self.canned = canned  # keyed by a short tag the caller passes in `user`
 
-    def complete_json(self, system: str, user: str, max_tokens: int = 2000) -> dict:
+    def complete_json(self, system: str | list[dict], user: str, max_tokens: int = 2000) -> dict:
         for tag, payload in self.canned.items():
             if tag in user:
                 return payload

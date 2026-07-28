@@ -180,15 +180,24 @@ prose outside the JSON:
 """
 
 
-def _build_system_prompt(skillset: SkillSet, target_features: list[str]) -> str:
-    blocks = [
-        INSTRUCTION_BLOCK,
-        skillset.grammar.text,
-        skillset.client_dna.text,
-    ]
+def _build_system_prompt(skillset: SkillSet, target_features: list[str]) -> list[dict]:
+    """Returns cache-marked content blocks rather than one joined string. The
+    static block (instructions + grammar + client-dna) is IDENTICAL on every
+    single planner call regardless of target_features -- confirmed to be ~14K
+    of the ~25K tokens per call. Marking it cache_control lets Anthropic bill it
+    at ~10% of normal input cost on every call within the ~5-minute cache window
+    after the first, instead of full price every time. Each feature skill gets
+    its own cache breakpoint too, since the same feature recurs across calls in
+    a session. Anthropic allows up to 4 cache breakpoints per request -- this
+    uses 1 (static) + up to 3 (one per registered feature), exactly at the limit
+    if all three features are ever targeted together.
+    """
+    static_text = "\n\n".join([INSTRUCTION_BLOCK, skillset.grammar.text, skillset.client_dna.text])
+    blocks = [{"type": "text", "text": static_text, "cache_control": {"type": "ephemeral"}}]
     for f in target_features:
-        blocks.append(skillset.feature(f).text)
-    return "\n\n".join(blocks)
+        blocks.append({"type": "text", "text": skillset.feature(f).text,
+                       "cache_control": {"type": "ephemeral"}})
+    return blocks
 
 
 def generate_plan(prompt: str, router_output: dict, skillset: SkillSet, llm) -> dict:
