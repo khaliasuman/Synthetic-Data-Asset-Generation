@@ -132,6 +132,14 @@ YOUR JOB, IN ORDER:
     - The entry/orchestrator node should wrap its core action in a minimal
       try/except, calling dbutils.notebook.exit("FAILED: <reason>") or raising on
       failure -- not silently succeeding regardless of outcome.
+    - CRITICAL: never wrap a %run or dbutils.notebook.run line in that try/except.
+      Those lines are ALWAYS stripped from node_code before rendering (they come
+      from code_graph.edges instead) -- wrapping one in try/except leaves an
+      EMPTY try block after stripping, which is a Python SyntaxError. Confirmed
+      live: this produced unparseable notebooks in real generated bundles. The
+      try/except must wrap the node's OWN business logic (a read, a write, a
+      validation call) -- something that survives stripping -- never the
+      reference-mechanism line itself.
     - At least one data-loading node should include a basic null/quality check
       (e.g. .filter(col(...).isNotNull()) or an explicit row-count assertion)
       rather than reading and writing with no validation at all.

@@ -76,6 +76,22 @@ def run(plan: dict, out_dir: str | Path) -> list[tuple[str, bool, str]]:
                     dupe_widget_lines.append((nid, line.strip()))
     check("no_duplicated_widget_declaration", not dupe_widget_lines, str(dupe_widget_lines))
 
+    # A try: line with nothing indented beneath it (or immediately followed by
+    # except/finally) is a Python SyntaxError. Confirmed live: stripping a
+    # duplicated %run line that was the sole content of a try block produced
+    # exactly this. The materializer's strip function now guards against this,
+    # but this check is the deterministic backstop -- catches any variant that
+    # slips past it, including one the model writes with no stripping involved.
+    empty_try_nodes = []
+    for nid, node_code in plan.get("_node_code", {}).items():
+        lines = node_code.get("executable", [])
+        for i, line in enumerate(lines):
+            if line.strip().endswith("try:"):
+                nxt = lines[i + 1].strip() if i + 1 < len(lines) else ""
+                if not nxt or nxt.startswith(("except", "finally")):
+                    empty_try_nodes.append((nid, i))
+    check("no_empty_try_block", not empty_try_nodes, str(empty_try_nodes))
+
     # A library_type knob claiming a real library exists ("whl_workspace_file")
     # with library_count >= 1 must be backed by an actual library_src node in the
     # graph -- otherwise the plan claims a dependency that never gets materialized.

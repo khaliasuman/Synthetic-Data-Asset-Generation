@@ -2,7 +2,7 @@
 dpstudio/engine/materializer.py
 
 Reads ONLY the plan (plan_only_input, per the grammar's materialization_contract).
-Writes real notebooks, builds a real wheel from generated source, writes a 
+Writes real notebooks, builds a real wheel from generated source, writes a
 databricks.yml, and stamps plan_id into every artifact. No LLM call.
 """
 from __future__ import annotations
@@ -152,16 +152,35 @@ def _strip_duplicated_reference_lines(plan: dict) -> dict:
         cleaned = [line for line in executable
                   if "%run " not in line and "dbutils.notebook.run(" not in line
                   and not (widgets_mode and ("widgets.removeAll" in line or "widgets.text(" in line))]
-        if len(cleaned) != len(executable):
-            removed = [l for l in executable if l not in cleaned]
+
+        # Guard against stripping leaving a `try:` with nothing inside it --
+        # confirmed live: the realism-floor instruction (planner.py 2i) told the
+        # model to wrap its "core action" in try/except, and it sometimes wraps
+        # the %run/dbutils.notebook.run line itself. Once that line is correctly
+        # stripped (it's rendered separately via the edge), an empty try: block
+        # is a straight SyntaxError -- worse than the duplication it replaced.
+        # Insert a harmless `pass` rather than leave invalid Python.
+        fixed = []
+        for i, line in enumerate(cleaned):
+            fixed.append(line)
+            stripped = line.strip()
+            if stripped.endswith("try:"):
+                nxt = cleaned[i + 1].strip() if i + 1 < len(cleaned) else ""
+                if nxt.startswith("except") or nxt.startswith("finally") or not nxt:
+                    indent = line[:len(line) - len(line.lstrip())] + "    "
+                    fixed.append(f"{indent}pass")
+
+        if fixed != executable:
+            removed = [l for l in executable if l not in fixed]
             plan.setdefault("plan_notes", "")
             plan["plan_notes"] = (
                 f"{plan['plan_notes']} strip_duplicated_reference_lines: removed "
                 f"{removed} from node {node_id} -- already rendered via a "
                 f"code_graph edge or the widgets preamble, duplicate literal "
-                f"line discarded."
+                f"line discarded (inserted a placeholder pass if this left an "
+                f"empty try block)."
             ).strip()
-            node_code["executable"] = cleaned
+            node_code["executable"] = fixed
     return plan
 
 
