@@ -161,6 +161,28 @@ def extract_data_contract(plan: dict) -> dict:
     }
 
 
+def extract_all_widget_names(plan: dict) -> list[str]:
+    """Scans every node's generated code for dbutils.widgets.text(...) /
+    dbutils.widgets.get(...) calls and returns the complete real set of widget
+    names the bundle actually uses.
+
+    Confirmed live as a real, distinct gap from the standard preamble: the
+    model can (and does) declare a widget directly inside its own business
+    logic code -- `input_table = dbutils.widgets.get('input_table')` -- for a
+    name that was never part of knobs.param_names. Job-parameter generation
+    previously only ever iterated knobs.param_names (the PLAN's declaration of
+    what it intended to parameterize), which can drift out of sync with what
+    the CODE actually declares. Same fix philosophy as the rest of this
+    module: derive from the real code, don't trust a separate declaration.
+    """
+    names: set[str] = set()
+    pat = re.compile(r"dbutils\.widgets\.(?:text|get|dropdown|combobox)\(\s*['\"](\w+)['\"]")
+    for node_code in plan.get("_node_code", {}).values():
+        for line in node_code.get("executable", []):
+            names.update(pat.findall(line))
+    return sorted(names)
+
+
 def render_seed_sql(contract: dict, row_count: int = 10000) -> list[str]:
     """Emits the CREATE TABLE ... AS SELECT statements that make the contract
     real: every table the code reads, with every column the code references,
