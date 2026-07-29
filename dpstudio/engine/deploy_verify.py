@@ -125,16 +125,30 @@ def deploy_and_run(plan: dict, out_dir: str | Path, workspace_client) -> dict:
             f"Problems: {code_check['problems']}"
         )
 
-    # Explicitly register every referenced notebook via the proper Workspace
-    # API before job creation, rather than hoping materialize()'s raw file
-    # write is independently visible to the Jobs API's own object registry.
+    # Explicitly register EVERY entry/child notebook the plan produced, not
+    # just the job's own top-level task notebooks. Confirmed live: a %run
+    # child (data_validator.py) was written to disk by materialize() but
+    # never registered, since the original fix only covered the notebooks
+    # directly referenced in settings["tasks"] -- the top-level task
+    # notebook(s), not every node a %run chain might reach. A %run reference
+    # resolves against the same workspace object registry as the Jobs API,
+    # so every entry/child .py file needs the same explicit registration,
+    # not just the one(s) the job itself points at directly.
+    out_dir = Path(out_dir)
     registration_errors = []
-    for task in settings["tasks"]:
-        path = task.notebook_task.notebook_path
+    for node in plan.get("code_graph", {}).get("nodes", []):
+        if node.get("role") in ("entry", "child"):
+            path = str(out_dir / "src" / "notebooks" / f"{node['node_id']}.py")
+            try:
+                _ensure_registered(workspace_client, path)
+            except Exception as e:
+                registration_errors.append((path, str(e)))
+    seed_path = out_dir / "src" / "notebooks" / "_seed.py"
+    if seed_path.exists():
         try:
-            _ensure_registered(workspace_client, path)
+            _ensure_registered(workspace_client, str(seed_path))
         except Exception as e:
-            registration_errors.append((path, str(e)))
+            registration_errors.append((str(seed_path), str(e)))
     if registration_errors:
         raise RuntimeError(
             f"Failed to register one or more notebooks via the Workspace API "
