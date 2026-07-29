@@ -29,10 +29,17 @@ from pathlib import Path
 def build_job_settings(plan: dict, out_dir: str | Path) -> dict:
     """Translates the plan + materialized out_dir into a Jobs API create-job
     settings dict -- the SDK equivalent of what _render_bundle_yaml builds as
-    YAML, but as native JSON, since we're calling the Jobs API directly rather
-    than going through `databricks bundle deploy` (which needs the CLI, which
-    doesn't work in a Free Edition notebook cell).
+    YAML, but as native SDK objects, since we're calling the Jobs API directly
+    rather than going through `databricks bundle deploy` (which needs the CLI,
+    which doesn't work in a Free Edition notebook cell).
+
+    IMPORTANT: jobs.create() requires typed SDK objects (jobs.Task,
+    jobs.NotebookTask, jobs.TaskDependency), not plain dicts -- confirmed live
+    (AttributeError: 'dict' object has no attribute 'as_dict') when this first
+    passed raw dicts. Fixed to construct the real SDK dataclasses.
     """
+    from databricks.sdk.service import jobs as sdk_jobs
+
     out_dir = Path(out_dir)
     pid = plan["plan_id"]
     entry = next(n["node_id"] for n in plan["code_graph"]["nodes"] if n.get("role") == "entry")
@@ -42,19 +49,20 @@ def build_job_settings(plan: dict, out_dir: str | Path) -> dict:
 
     tasks = []
     if include_seed:
-        tasks.append({
-            "task_key": "seed_task",
-            "notebook_task": {
-                "notebook_path": str(out_dir / "src" / "notebooks" / "_seed.py"),
-                "base_parameters": {"catalog": "main", "schema": f"synth_verify_{pid}"},
-            },
-        })
-    main_task = {
-        "task_key": "main_task",
-        "notebook_task": {"notebook_path": str(out_dir / "src" / "notebooks" / f"{entry}.py")},
-    }
-    if include_seed:
-        main_task["depends_on"] = [{"task_key": "seed_task"}]
+        tasks.append(sdk_jobs.Task(
+            task_key="seed_task",
+            notebook_task=sdk_jobs.NotebookTask(
+                notebook_path=str(out_dir / "src" / "notebooks" / "_seed.py"),
+                base_parameters={"catalog": "main", "schema": f"synth_verify_{pid}"},
+            ),
+        ))
+    main_task = sdk_jobs.Task(
+        task_key="main_task",
+        notebook_task=sdk_jobs.NotebookTask(
+            notebook_path=str(out_dir / "src" / "notebooks" / f"{entry}.py"),
+        ),
+        depends_on=[sdk_jobs.TaskDependency(task_key="seed_task")] if include_seed else None,
+    )
     tasks.append(main_task)
 
     return {
