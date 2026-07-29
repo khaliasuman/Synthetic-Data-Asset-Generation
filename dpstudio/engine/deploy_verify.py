@@ -108,6 +108,23 @@ def deploy_and_run(plan: dict, out_dir: str | Path, workspace_client) -> dict:
     """
     settings = build_job_settings(plan, out_dir)
 
+    # Preflight code gate: parse every generated notebook and verify each name
+    # it reads is actually resolvable at that point, following real execution
+    # order and %run namespace-sharing semantics. This one check replaces the
+    # whole category of "generated code references something unavailable"
+    # failures -- previously discovered one symptom at a time by deploying and
+    # watching the job fail (missing imports, unresolvable module names,
+    # variables used before assignment across a %run boundary, empty try
+    # blocks). Catching it here costs milliseconds; catching it by deploying
+    # costs a full job run and a confusing traceback.
+    from . import preflight
+    code_check = preflight.check_bundle(plan, out_dir)
+    if not code_check["ok"]:
+        raise RuntimeError(
+            "Preflight code check failed -- deploying would fail at runtime. "
+            f"Problems: {code_check['problems']}"
+        )
+
     # Explicitly register every referenced notebook via the proper Workspace
     # API before job creation, rather than hoping materialize()'s raw file
     # write is independently visible to the Jobs API's own object registry.

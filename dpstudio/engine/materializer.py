@@ -64,25 +64,38 @@ def _render_notebook(plan: dict, node_id: str) -> str:
 
 
 def _render_seed_notebook(plan: dict) -> str:
-    """Generates a real setup notebook that creates and populates every table
-    the plan's business logic references, using catalog/schema JOB PARAMETERS
-    (not hardcoded names) -- resolved at deploy time to whatever real catalog/
-    schema the deployer actually has, not baked in here. Runs as a prerequisite
-    task so the main job's reads/writes hit real data instead of tables that
-    were only ever a name in a plausible-looking string.
+    """Generates a real setup notebook creating exactly the tables and columns
+    the generated business logic actually READS, derived from that code rather
+    than invented independently.
 
-    This closes the "generated bundles fail immediately if actually run"
-    problem: previously nothing ever executed the DDL sitting in asset_0.sql,
-    so any real deployment hit 'table not found' on the first read.
+    Previously this created generic tables (synth_table_0) with generic columns
+    (row_id, user_id, event_ts, value) while the generated code read whatever
+    business-plausible names the model made up (orders, order_date, amount).
+    Those two sets never matched, so every deployment that got past name
+    resolution failed with TABLE_OR_VIEW_NOT_FOUND and then UNRESOLVED_COLUMN.
+
+    Uses catalog/schema JOB PARAMETERS, never hardcoded names, so it resolves
+    at deploy time against whatever real catalog/schema the deployer has.
     """
+    from .data_contract import extract_data_contract, render_seed_sql
+
     pid = plan["plan_id"]
+    contract = extract_data_contract(plan)
+
+    row_count = 10000
+    for asset in plan.get("assets", []):
+        tp = asset.get("table_physical", {}) or {}
+        candidate = tp.get("total_row_count") or tp.get("avg_partition_row_count")
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            row_count = min(int(candidate), 1_000_000)  # cap seed volume, not the plan's claimed scale
+            break
+
     lines = [
         "# Databricks notebook source",
         f"# plan_id: {pid}  plan_version: {plan.get('plan_version', 1)}",
-        "# Seed step -- creates and populates every table this plan's business",
-        "# logic reads or writes, using real job parameters (not hardcoded names).",
-        "# This task must run BEFORE the main task (wired via depends_on in",
-        "# databricks.yml) so downstream reads hit real data.",
+        "# Seed step -- creates exactly the tables and columns the generated",
+        "# business logic reads, derived from that code (not invented separately).",
+        "# Runs BEFORE the main task via depends_on, so downstream reads hit real data.",
         "# COMMAND ----------",
         'dbutils.widgets.text("catalog", "main")',
         'dbutils.widgets.text("schema", "synth_studio")',
@@ -93,31 +106,18 @@ def _render_seed_notebook(plan: dict) -> str:
         "# COMMAND ----------",
     ]
 
-    for i, asset in enumerate(plan.get("assets", [])):
-        tp = asset.get("table_physical", {}) or {}
-        table_name = f"synth_table_{i}"
-        row_count = tp.get("total_row_count") or tp.get("avg_partition_row_count") or 10000
-        row_count = min(int(row_count), 1_000_000)  # cap synthetic seed volume, not the plan's claimed scale
-        cluster_clause = ""
-        if tp.get("cluster_by"):
-            cols = ", ".join(tp["cluster_by"])
-            cluster_clause = f" CLUSTER BY ({cols})"
+    seed_statements = render_seed_sql(contract, row_count=row_count)
+    if not seed_statements:
+        lines.append("print('No read tables referenced by this plan -- nothing to seed.')")
+    else:
+        for stmt in seed_statements:
+            lines.append("spark.sql(f'''")
+            lines.extend(stmt.split("\n"))
+            lines.append("''')")
+            lines.append("# COMMAND ----------")
+        tables = ", ".join(contract["read_tables"])
+        lines.append(f"print(f'Seed complete: created {tables} under {{catalog}}.{{schema}}')")
 
-        lines += [
-            f"# --- {table_name} ---",
-            f"spark.sql(f'''",
-            f"  CREATE TABLE IF NOT EXISTS {{catalog}}.{{schema}}.{table_name}{cluster_clause}",
-            f"  USING DELTA AS",
-            f"  SELECT id AS row_id, ",
-            f"         cast(rand() * 1000000 as int) AS user_id,",
-            f"         current_timestamp() AS event_ts,",
-            f"         cast(rand() * 100 as double) AS value",
-            f"  FROM range({row_count})",
-            f"''')",
-            "# COMMAND ----------",
-        ]
-
-    lines.append("print(f'Seed complete: tables created under {catalog}.{schema}')")
     return "\n".join(lines)
 
 
@@ -178,26 +178,79 @@ def _render_bundle_yaml(plan: dict, whl_name: str | None, include_seed_task: boo
                       f"        timezone_id: America/Los_Angeles\n")
 
     # Job-level parameters (real Databricks Asset Bundle feature): the deployer
-    # supplies actual catalog/schema at deploy or run time, referenced via
+    # supplies actual values at deploy or run time, referenced via
     # {{job.parameters.<name>}} in each task's base_parameters. Nothing here is
-    # a fictional hardcoded name -- "main"/"synth_studio" are only DEFAULTS,
-    # fully overridable, never assumed to exist.
-    params_block = ("      parameters:\n"
-                    "        - name: catalog\n          default: main\n"
-                    "        - name: schema\n          default: synth_studio\n") if include_seed_task else ""
+    # a fictional hardcoded name -- these are only DEFAULTS, fully overridable.
+    #
+    # CRITICAL fix: previously only catalog/schema ever got a job parameter,
+    # and only seed_task ever got base_parameters at all. Confirmed live: every
+    # OTHER widget (source_table, target_table, receive_date, etc.) silently
+    # defaulted to its widgets.text(..., "") empty-string default the moment
+    # the job actually ran, since main_task never supplied real values --
+    # causing spark.read.table("") to fail with a SQL parse error on an empty
+    # statement. Now every declared param gets a job-level parameter with a
+    # smart default: table-referencing names point at the actual table(s) the
+    # seed step creates, so reads/writes hit real data instead of an empty
+    # string or an unrelated placeholder name.
+    param_names = plan.get("knobs", {}).get("param_names") or (
+        ["catalog", "schema"] if include_seed_task else [])
+
+    # Table-name widget defaults must point at the tables the seed actually
+    # creates, which are now derived from what the code reads -- not the old
+    # generic synth_table_N names, which matched nothing the code referenced.
+    from .data_contract import extract_data_contract
+    _contract = extract_data_contract(plan)
+    _read_tables = _contract["read_tables"]
+    _write_tables = _contract["write_tables"]
+
+    def _smart_default(name: str) -> str:
+        n = name.lower()
+        if name == "catalog":
+            return "main"
+        if name == "schema":
+            return "synth_studio"
+        if "table" in n:
+            # A widget named like an output points at a write table; anything
+            # else table-shaped points at a seeded read table.
+            if any(k in n for k in ("target", "output", "dest", "sink")) and _write_tables:
+                return _write_tables[0]
+            if _read_tables:
+                return _read_tables[0]
+            return _write_tables[0] if _write_tables else "synth_table"
+        if "date" in n:
+            return '"2026-01-01"'
+        return "synthetic_default"
+
+    params_block = ""
+    base_params_lines = ""
+    if param_names:
+        params_block = "      parameters:\n" + "".join(
+            f"        - name: {p}\n          default: {_smart_default(p)}\n" for p in param_names
+        )
+        base_params_lines = "".join(
+            f'              {p}: "{{{{job.parameters.{p}}}}}"\n' for p in param_names
+        )
 
     seed_task_block = ""
     depends_on_block = ""
     if include_seed_task:
+        # Seed task only ever needs catalog/schema, regardless of what else
+        # the main task's own widgets declare.
+        seed_base_params = "".join(
+            f'              {p}: "{{{{job.parameters.{p}}}}}"\n' for p in param_names if p in ("catalog", "schema")
+        )
         seed_task_block = (
             "        - task_key: seed_task\n"
             "          notebook_task:\n"
             "            notebook_path: ./src/notebooks/_seed.py\n"
             "            base_parameters:\n"
-            "              catalog: \"{{job.parameters.catalog}}\"\n"
-            "              schema: \"{{job.parameters.schema}}\"\n"
+            f"{seed_base_params}"
         )
         depends_on_block = "          depends_on:\n            - task_key: seed_task\n"
+
+    main_base_params_block = (
+        "            base_parameters:\n" + base_params_lines if base_params_lines else ""
+    )
 
     return f"""# plan_id: {pid}  plan_version: {pver}  (generated {datetime.now(timezone.utc).isoformat()})
 bundle:
@@ -215,7 +268,7 @@ resources:
 {seed_task_block}        - task_key: main_task
 {depends_on_block}          notebook_task:
             notebook_path: ./src/notebooks/{entry}.py
-{lib_line}
+{main_base_params_block}{lib_line}
 """
 
 
