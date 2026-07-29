@@ -192,13 +192,20 @@ def _render_bundle_yaml(plan: dict, whl_name: str | None, include_seed_task: boo
     # smart default: table-referencing names point at the actual table(s) the
     # seed step creates, so reads/writes hit real data instead of an empty
     # string or an unrelated placeholder name.
-    param_names = plan.get("knobs", {}).get("param_names") or (
-        ["catalog", "schema"] if include_seed_task else [])
+    from .data_contract import extract_data_contract, extract_all_widget_names
 
-    # Table-name widget defaults must point at the tables the seed actually
-    # creates, which are now derived from what the code reads -- not the old
-    # generic synth_table_N names, which matched nothing the code referenced.
-    from .data_contract import extract_data_contract
+    # Union, not just knobs.param_names: the model can declare a widget
+    # directly in business logic beyond what the plan declared it intended to
+    # parameterize -- confirmed live (input_table declared inline, never in
+    # param_names, silently defaulted to empty string at job runtime). Scan
+    # the real code so no widget the job actually reads is ever left without
+    # a real job parameter behind it.
+    declared_params = plan.get("knobs", {}).get("param_names") or []
+    real_widgets = extract_all_widget_names(plan)
+    param_names = list(dict.fromkeys(
+        (["catalog", "schema"] if include_seed_task else []) + declared_params + real_widgets
+    ))
+
     _contract = extract_data_contract(plan)
     _read_tables = _contract["read_tables"]
     _write_tables = _contract["write_tables"]
@@ -330,6 +337,56 @@ def _fix_cross_node_execution_order(plan: dict) -> dict:
                 f"{parent_id}'s own code -- it was invoked before {parent_id} had "
                 f"computed a variable {child_id}'s code depends on."
             ).strip()
+    return plan
+
+
+_VOLUME_LOAD_PATTERN = re.compile(
+    r"spark\.read\.format\(\s*['\"]delta['\"]\s*\)\.load\(\s*f?['\"]"
+    r"/Volumes/\{catalog\}/\{schema\}/([\w]+)['\"]\s*\)"
+)
+
+
+def normalize_volume_reads(plan: dict) -> dict:
+    """Rewrites `spark.read.format('delta').load(f'/Volumes/{catalog}/{schema}/X')`
+    to `spark.read.table(f'{catalog}.{schema}.X')`.
+
+    Confirmed live: a raw Volume-path Delta load referenced a Volume that was
+    never seeded, because extract_data_contract only recognizes
+    spark.read.table/spark.table/SQL FROM-JOIN as read patterns -- a
+    fundamentally different I/O surface (Unity Catalog Volumes hold files;
+    seeding one for real means writing actual Delta files into it, not just
+    creating a managed table). Rather than add a second, heavier seeding
+    mechanism for Volumes specifically, this rewrites the code to the ONE
+    access pattern the seed step already handles reliably: a managed table.
+    Same "derive from and normalize the real code" philosophy as the rest of
+    this module -- one guaranteed I/O path beats supporting every variant.
+    """
+    changed_any = False
+    for node_id, node_code in plan.get("_node_code", {}).items():
+        executable = node_code.get("executable", [])
+        fixed = []
+        changed = False
+        for line in executable:
+            m = _VOLUME_LOAD_PATTERN.search(line)
+            if m:
+                table_name = m.group(1)
+                new_line = _VOLUME_LOAD_PATTERN.sub(
+                    f"spark.read.table(f'{{catalog}}.{{schema}}.{table_name}')", line)
+                fixed.append(new_line)
+                changed = True
+            else:
+                fixed.append(line)
+        if changed:
+            node_code["executable"] = fixed
+            changed_any = True
+
+    if changed_any:
+        plan.setdefault("plan_notes", "")
+        plan["plan_notes"] = (
+            f"{plan['plan_notes']} normalize_volume_reads: rewrote raw Volume-path "
+            f"Delta load(s) to managed-table reads, since the seed step creates "
+            f"managed tables, not real Unity Catalog Volume files."
+        ).strip()
     return plan
 
 
@@ -581,6 +638,7 @@ def materialize(plan: dict, out_dir: str | Path) -> dict:
     # %pip install line silently never got added at all.
     whl = _build_wheel(plan, out_dir, artifacts)
 
+    plan = normalize_volume_reads(plan)
     plan = _fix_python_imports(plan, out_dir)
     plan = _fix_cross_node_execution_order(plan)
     plan = _strip_duplicated_reference_lines(plan)
