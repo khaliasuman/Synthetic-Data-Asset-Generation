@@ -8,6 +8,7 @@ databricks.yml, and stamps plan_id into every artifact. No LLM call.
 from __future__ import annotations
 
 import hashlib
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -62,6 +63,64 @@ def _render_notebook(plan: dict, node_id: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _render_seed_notebook(plan: dict) -> str:
+    """Generates a real setup notebook that creates and populates every table
+    the plan's business logic references, using catalog/schema JOB PARAMETERS
+    (not hardcoded names) -- resolved at deploy time to whatever real catalog/
+    schema the deployer actually has, not baked in here. Runs as a prerequisite
+    task so the main job's reads/writes hit real data instead of tables that
+    were only ever a name in a plausible-looking string.
+
+    This closes the "generated bundles fail immediately if actually run"
+    problem: previously nothing ever executed the DDL sitting in asset_0.sql,
+    so any real deployment hit 'table not found' on the first read.
+    """
+    pid = plan["plan_id"]
+    lines = [
+        "# Databricks notebook source",
+        f"# plan_id: {pid}  plan_version: {plan.get('plan_version', 1)}",
+        "# Seed step -- creates and populates every table this plan's business",
+        "# logic reads or writes, using real job parameters (not hardcoded names).",
+        "# This task must run BEFORE the main task (wired via depends_on in",
+        "# databricks.yml) so downstream reads hit real data.",
+        "# COMMAND ----------",
+        'dbutils.widgets.text("catalog", "main")',
+        'dbutils.widgets.text("schema", "synth_studio")',
+        'catalog = dbutils.widgets.get("catalog")',
+        'schema = dbutils.widgets.get("schema")',
+        "spark.sql(f'CREATE CATALOG IF NOT EXISTS {catalog}')",
+        "spark.sql(f'CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}')",
+        "# COMMAND ----------",
+    ]
+
+    for i, asset in enumerate(plan.get("assets", [])):
+        tp = asset.get("table_physical", {}) or {}
+        table_name = f"synth_table_{i}"
+        row_count = tp.get("total_row_count") or tp.get("avg_partition_row_count") or 10000
+        row_count = min(int(row_count), 1_000_000)  # cap synthetic seed volume, not the plan's claimed scale
+        cluster_clause = ""
+        if tp.get("cluster_by"):
+            cols = ", ".join(tp["cluster_by"])
+            cluster_clause = f" CLUSTER BY ({cols})"
+
+        lines += [
+            f"# --- {table_name} ---",
+            f"spark.sql(f'''",
+            f"  CREATE TABLE IF NOT EXISTS {{catalog}}.{{schema}}.{table_name}{cluster_clause}",
+            f"  USING DELTA AS",
+            f"  SELECT id AS row_id, ",
+            f"         cast(rand() * 1000000 as int) AS user_id,",
+            f"         current_timestamp() AS event_ts,",
+            f"         cast(rand() * 100 as double) AS value",
+            f"  FROM range({row_count})",
+            f"''')",
+            "# COMMAND ----------",
+        ]
+
+    lines.append("print(f'Seed complete: tables created under {catalog}.{schema}')")
+    return "\n".join(lines)
+
+
 def _build_wheel(plan: dict, out_dir: Path, artifacts: list) -> Path | None:
     lib_nodes = [n for n in plan["code_graph"]["nodes"] if n.get("role") == "library_src"]
     if not lib_nodes:
@@ -88,11 +147,19 @@ def _build_wheel(plan: dict, out_dir: Path, artifacts: list) -> Path | None:
     return whl
 
 
-def _render_bundle_yaml(plan: dict, whl_name: str | None) -> str:
+def _render_bundle_yaml(plan: dict, whl_name: str | None, include_seed_task: bool = False) -> str:
     pid, pver = plan["plan_id"], plan["plan_version"]
     entry = next(n["node_id"] for n in plan["code_graph"]["nodes"] if n.get("role") == "entry")
+
+    # KNOWN PLACEHOLDER, not a real path in any workspace: parameter substitution
+    # for job-cluster library dependency paths is not confirmed safe across all
+    # Databricks bundle schema versions, so this is left explicit and flagged
+    # rather than silently guessed at. Replace with a real Unity Catalog Volume
+    # path in YOUR workspace before deploying live -- this is the one piece of
+    # this bundle that still requires a manual edit.
     lib_line = (f"      environments:\n        - environment_key: default\n"
                 f"          spec:\n            dependencies:\n"
+                f"              # PLACEHOLDER -- replace with a real Volume path in your workspace\n"
                 f"              - /Volumes/main/synth_studio/libs/{whl_name}\n"
                 if whl_name else "")
 
@@ -110,6 +177,28 @@ def _render_bundle_yaml(plan: dict, whl_name: str | None) -> str:
                       f"        quartz_cron_expression: \"0 {minute} {hour} * * ?\"\n"
                       f"        timezone_id: America/Los_Angeles\n")
 
+    # Job-level parameters (real Databricks Asset Bundle feature): the deployer
+    # supplies actual catalog/schema at deploy or run time, referenced via
+    # {{job.parameters.<name>}} in each task's base_parameters. Nothing here is
+    # a fictional hardcoded name -- "main"/"synth_studio" are only DEFAULTS,
+    # fully overridable, never assumed to exist.
+    params_block = ("      parameters:\n"
+                    "        - name: catalog\n          default: main\n"
+                    "        - name: schema\n          default: synth_studio\n") if include_seed_task else ""
+
+    seed_task_block = ""
+    depends_on_block = ""
+    if include_seed_task:
+        seed_task_block = (
+            "        - task_key: seed_task\n"
+            "          notebook_task:\n"
+            "            notebook_path: ./src/notebooks/_seed.py\n"
+            "            base_parameters:\n"
+            "              catalog: \"{{job.parameters.catalog}}\"\n"
+            "              schema: \"{{job.parameters.schema}}\"\n"
+        )
+        depends_on_block = "          depends_on:\n            - task_key: seed_task\n"
+
     return f"""# plan_id: {pid}  plan_version: {pver}  (generated {datetime.now(timezone.utc).isoformat()})
 bundle:
   name: synthetic_{pid}
@@ -122,12 +211,146 @@ resources:
         plan_id: {pid}
         plan_version: "{pver}"
         scenario_type: {plan.get('scenario_type', 'positive')}
-{sched_line}      tasks:
-        - task_key: main_task
-          notebook_task:
+{params_block}{sched_line}      tasks:
+{seed_task_block}        - task_key: main_task
+{depends_on_block}          notebook_task:
             notebook_path: ./src/notebooks/{entry}.py
 {lib_line}
 """
+
+
+def _fix_python_imports(plan: dict, out_dir: Path) -> dict:
+    """Fixes THREE distinct import/environment problems, each found via actual
+    live execution -- none of these were ever visible to any static check,
+    since none of them execute Python:
+
+    1. library_src nodes: built into a real wheel by _build_wheel(), always
+       nested inside a fixed `dp_synth_lib` package. `from {node_id} import X`
+       needs the dp_synth_lib. prefix to resolve.
+
+    2. module nodes: plain .py files, never wheel-packaged, never
+       automatically on sys.path. Needs sys.path.append() before the import.
+
+    3. Missing pyspark.sql.functions imports: confirmed live -- generated code
+       called col(...) without importing it. The planner writes plausible
+       PySpark code but doesn't always import every function it uses. Scanned
+       and auto-injected here rather than trusted to the model, since this is
+       a purely mechanical check (does the code call a name from a known
+       function list without importing it) that code can verify perfectly and
+       a model can silently miss.
+
+    ADDITIONALLY: the wheel for a library_src import is only ever installed
+    when the bundle runs as an actual JOB (via databricks.yml's environment/
+    dependencies block) -- confirmed live that opening and running the SAME
+    notebook interactively in the editor never installs it at all, so even a
+    correctly-prefixed dp_synth_lib import fails outside a job run. Fixed by
+    ALSO injecting a %pip install of the wheel's real local materialized path
+    (not the still-unresolved placeholder Volume path) -- this works in BOTH
+    interactive and job contexts, and doesn't depend on any Volume existing.
+    """
+    all_nodes = {n["node_id"]: n for n in plan.get("code_graph", {}).get("nodes", [])}
+    lib_node_ids = {nid for nid, n in all_nodes.items() if n.get("role") == "library_src"}
+    module_node_ids = {nid for nid, n in all_nodes.items() if n.get("role") == "module"}
+
+    notebooks_dir = str(Path(out_dir) / "src" / "notebooks")
+    wheel_glob = list((Path(out_dir) / "dist").glob("*.whl")) if (Path(out_dir) / "dist").exists() else []
+    wheel_path = str(wheel_glob[0]) if wheel_glob else None
+
+    import_re = re.compile(r"^(\s*from\s+)(\w+)(\s+import\s+.*)$")
+
+    def _resolve_real_node_id(imported_name: str) -> tuple[str, str] | None:
+        """Returns (real_node_id, role) if imported_name resolves to a real
+        node, either exactly or via the common _lib/_module suffix pattern.
+        Confirmed live: a library_src node named 'transformation_utils_lib'
+        was imported as 'from transformation_utils import X' (missing the
+        suffix) -- exact matching silently skipped this entirely, since
+        'transformation_utils' != 'transformation_utils_lib'. The model
+        commonly imports using the shorter, more natural-sounding base name
+        even when the actual node carries a _lib/_module suffix.
+        """
+        if imported_name in lib_node_ids:
+            return imported_name, "library_src"
+        if imported_name in module_node_ids:
+            return imported_name, "module"
+        for suffix in ("_lib", "_module"):
+            candidate = imported_name + suffix
+            if candidate in lib_node_ids:
+                return candidate, "library_src"
+            if candidate in module_node_ids:
+                return candidate, "module"
+        return None
+
+    # Common pyspark.sql.functions names worth checking for bare, unimported use.
+    PYSPARK_FUNCTIONS = {
+        "col", "sum", "avg", "count", "max", "min", "when", "lit", "window",
+        "current_timestamp", "current_date", "date_format", "to_date", "concat",
+        "coalesce", "round", "cast", "row_number", "rank", "dense_rank",
+        "first", "last", "collect_list", "collect_set", "explode", "isnull",
+        "isnotnull", "regexp_replace", "trim", "upper", "lower", "split",
+    }
+
+    for node_id, node_code in plan.get("_node_code", {}).items():
+        executable = node_code.get("executable", [])
+        fixed = []
+        needs_syspath = False
+        needs_pip_install = False
+        changed = False
+
+        already_imports_functions = any(
+            "from pyspark.sql.functions import" in l or "import pyspark.sql.functions" in l
+            for l in executable
+        )
+
+        for line in executable:
+            m = import_re.match(line)
+            resolved = _resolve_real_node_id(m.group(2)) if m else None
+            if resolved:
+                real_node_id, role = resolved
+                if role == "library_src":
+                    fixed.append(f"{m.group(1)}dp_synth_lib.{real_node_id}{m.group(3)}")
+                    needs_pip_install = True
+                else:
+                    fixed.append(f"{m.group(1)}{real_node_id}{m.group(3)}"
+                                 if real_node_id != m.group(2) else line)
+                    needs_syspath = True
+                changed = True
+            else:
+                fixed.append(line)
+
+        # Detect bare pyspark function calls not already imported.
+        if not already_imports_functions:
+            used = set()
+            for line in fixed:
+                for fn in PYSPARK_FUNCTIONS:
+                    if re.search(rf"(?<![\.\w]){fn}\s*\(", line):
+                        used.add(fn)
+            if used:
+                fixed = [f"from pyspark.sql.functions import {', '.join(sorted(used))}"] + fixed
+                changed = True
+
+        if needs_pip_install and wheel_path:
+            # No forced restartPython() here: in a real job run the Python
+            # process already starts fresh for that task, so there's nothing
+            # stale to restart away. In the entry node specifically, a restart
+            # would also wipe the catalog/schema/etc. variables just read from
+            # the widgets preamble (which runs before this code), breaking
+            # everything downstream. %pip install alone is correct and safe
+            # in both job and interactive-testing contexts.
+            fixed = [f"%pip install {wheel_path}"] + fixed
+            changed = True
+
+        if needs_syspath:
+            fixed = ["import sys", f"sys.path.append({notebooks_dir!r})"] + fixed
+
+        if changed:
+            plan.setdefault("plan_notes", "")
+            plan["plan_notes"] = (
+                f"{plan['plan_notes']} fix_python_imports: corrected node {node_id} -- "
+                f"dp_synth_lib prefix / sys.path.append / missing pyspark.sql.functions "
+                f"import / %pip install wheel, as applicable."
+            ).strip()
+            node_code["executable"] = fixed
+    return plan
 
 
 def _strip_duplicated_reference_lines(plan: dict) -> dict:
@@ -231,13 +454,22 @@ def _connect_orphaned_nodes(plan: dict) -> dict:
 
 
 def materialize(plan: dict, out_dir: str | Path) -> dict:
-    plan = _strip_duplicated_reference_lines(plan)
-    plan = _connect_orphaned_nodes(plan)
     out_dir = Path(out_dir)
     (out_dir / "src" / "notebooks").mkdir(parents=True, exist_ok=True)
     (out_dir / "src" / "sql").mkdir(parents=True, exist_ok=True)
     artifacts: list = []
     pid = plan["plan_id"]
+
+    # Build the wheel FIRST, before fixing imports -- _fix_python_imports needs
+    # to find the REAL wheel file on disk to write a correct %pip install path.
+    # Confirmed as a real ordering bug: when this ran in the opposite order,
+    # dist/*.whl didn't exist yet, so the glob found nothing and the
+    # %pip install line silently never got added at all.
+    whl = _build_wheel(plan, out_dir, artifacts)
+
+    plan = _fix_python_imports(plan, out_dir)
+    plan = _strip_duplicated_reference_lines(plan)
+    plan = _connect_orphaned_nodes(plan)
 
     for n in plan["code_graph"]["nodes"]:
         if n.get("role") in ("entry", "child"):
@@ -250,9 +482,17 @@ def materialize(plan: dict, out_dir: str | Path) -> dict:
             (out_dir / rel).write_text(f"# plan_id: {pid}\n{code}\n")
             _stamp(artifacts, "python_module", rel, node_id=n["node_id"])
 
-    whl = _build_wheel(plan, out_dir, artifacts)
+    # Seed step: only worth generating when there's actually something to
+    # seed (assets with real table_physical data) -- a plan with no assets
+    # has nothing for a seed step to create.
+    include_seed = bool(plan.get("assets")) and any(
+        a.get("table_physical") for a in plan["assets"])
+    if include_seed:
+        seed_rel = "src/notebooks/_seed.py"
+        (out_dir / seed_rel).write_text(_render_seed_notebook(plan))
+        _stamp(artifacts, "notebook", seed_rel, node_id="_seed")
 
-    yml = _render_bundle_yaml(plan, whl.name if whl else None)
+    yml = _render_bundle_yaml(plan, whl.name if whl else None, include_seed_task=include_seed)
     (out_dir / "databricks.yml").write_text(yml)
     _stamp(artifacts, "bundle_yaml", "databricks.yml")
 

@@ -72,6 +72,34 @@ def build_job_settings(plan: dict, out_dir: str | Path) -> dict:
     }
 
 
+def _ensure_registered(workspace_client, path: str) -> None:
+    """Explicitly (re-)registers a file as a proper workspace object via the
+    Workspace API, rather than relying on a raw filesystem write (what
+    materialize() does) to also be visible to the Jobs API.
+
+    Root cause found live: materialize() writes files via plain Python
+    open().write_text() to a /Workspace/... path. That write is genuinely
+    readable via plain Python file I/O immediately (confirmed: print(open(
+    path).read()) always worked). But workspace_client.workspace.get_status()
+    on that SAME exact path consistently failed with "doesn't exist", even
+    after 10s of retrying -- too long for a mere propagation lag. This points
+    at two DIFFERENT systems: the FUSE-mounted filesystem (what a raw write
+    touches) and the workspace's own object registry (what the Jobs API's
+    notebook_path resolution actually queries). A raw write may never appear
+    in the latter without an explicit import.
+
+    This function reads the already-written file's real content and uploads
+    it via workspace.upload(), which uses the correct object-registration API
+    -- guaranteeing the Jobs API can find it, rather than hoping a filesystem
+    write eventually becomes visible to a different index.
+    """
+    from databricks.sdk.service.workspace import ImportFormat, Language
+    content = Path(path).read_bytes()
+    workspace_client.workspace.upload(
+        path, content, format=ImportFormat.SOURCE, language=Language.PYTHON, overwrite=True,
+    )
+
+
 def deploy_and_run(plan: dict, out_dir: str | Path, workspace_client) -> dict:
     """Creates a real, temporary job from the plan and triggers a run.
     Returns {"job_id": ..., "run_id": ...} -- both needed for polling and
@@ -79,6 +107,23 @@ def deploy_and_run(plan: dict, out_dir: str | Path, workspace_client) -> dict:
     success or failure, or the job will linger in Workflows indefinitely.
     """
     settings = build_job_settings(plan, out_dir)
+
+    # Explicitly register every referenced notebook via the proper Workspace
+    # API before job creation, rather than hoping materialize()'s raw file
+    # write is independently visible to the Jobs API's own object registry.
+    registration_errors = []
+    for task in settings["tasks"]:
+        path = task.notebook_task.notebook_path
+        try:
+            _ensure_registered(workspace_client, path)
+        except Exception as e:
+            registration_errors.append((path, str(e)))
+    if registration_errors:
+        raise RuntimeError(
+            f"Failed to register one or more notebooks via the Workspace API "
+            f"before job creation: {registration_errors}."
+        )
+
     job = workspace_client.jobs.create(**settings)
     run = workspace_client.jobs.run_now(job_id=job.job_id)
     return {"job_id": job.job_id, "run_id": run.run_id}
@@ -100,12 +145,37 @@ def poll_run(workspace_client, run_id: int, timeout_s: int = 900, poll_seconds: 
 
         if life_cycle_str in ("TERMINATED", "SKIPPED", "INTERNAL_ERROR"):
             result_state = getattr(state, "result_state", None)
+            result_state_str = str(result_state.value) if hasattr(result_state, "value") else str(result_state)
+
+            # The top-level run state_message is often just "Workload failed,
+            # see run output for details" -- genuinely useless on its own.
+            # Fetch the actual per-task output (the real traceback/error) so a
+            # failure is diagnosable rather than a dead end. Best-effort: if
+            # this fetch itself fails, don't let that mask the original result.
+            task_outputs = {}
+            if result_state_str != "SUCCESS":
+                try:
+                    for task_run in getattr(run, "tasks", None) or []:
+                        try:
+                            out = workspace_client.jobs.get_run_output(run_id=task_run.run_id)
+                            task_outputs[task_run.task_key] = {
+                                "error": getattr(out, "error", None),
+                                "error_trace": getattr(out, "error_trace", None),
+                                "notebook_output_result": getattr(
+                                    getattr(out, "notebook_output", None), "result", None),
+                            }
+                        except Exception as e:
+                            task_outputs[task_run.task_key] = {"fetch_failed": str(e)}
+                except Exception:
+                    pass
+
             return {
                 "life_cycle_state": life_cycle_str,
-                "result_state": str(result_state.value) if hasattr(result_state, "value") else str(result_state),
+                "result_state": result_state_str,
                 "state_message": getattr(state, "state_message", ""),
                 "run_duration_s": round(time.time() - t0, 1),
                 "timed_out": False,
+                "task_outputs": task_outputs,
             }
         if time.time() - t0 > timeout_s:
             return {
@@ -125,6 +195,11 @@ def teardown(workspace_client, job_id: int, catalog: str = "main", schema: str |
     you most need it, since a job left behind after a failure is easy to forget
     about later.
 
+    Auto-discovers an available SQL warehouse for the schema-drop statement
+    rather than requiring the caller to know a specific warehouse_id -- this
+    was previously a silent gap: nothing ever supplied one, so schema_dropped
+    was always False and every seeded schema was left behind uncleaned.
+
     Returns a report of what succeeded/failed during teardown itself -- cleanup
     failures should be visible, not silently swallowed.
     """
@@ -137,14 +212,30 @@ def teardown(workspace_client, job_id: int, catalog: str = "main", schema: str |
         report["errors"].append(f"job deletion failed: {e}")
 
     if schema:
+        warehouse_id = None
         try:
-            workspace_client.statement_execution.execute_statement(
-                warehouse_id=None,  # caller must supply a real warehouse_id if using this path
-                statement=f"DROP SCHEMA IF EXISTS {catalog}.{schema} CASCADE",
-            )
-            report["schema_dropped"] = True
+            warehouses = list(workspace_client.warehouses.list())
+            running = [w for w in warehouses if str(getattr(w.state, "value", w.state)) == "RUNNING"]
+            chosen = running[0] if running else (warehouses[0] if warehouses else None)
+            warehouse_id = chosen.id if chosen else None
         except Exception as e:
-            report["errors"].append(f"schema drop failed: {e}")
+            report["errors"].append(f"warehouse discovery failed: {e}")
+
+        if not warehouse_id:
+            report["errors"].append(
+                "no SQL warehouse available to drop the seeded schema -- "
+                f"{catalog}.{schema} was left behind and needs manual cleanup, "
+                "or pass warehouse_id explicitly once one exists in this workspace."
+            )
+        else:
+            try:
+                workspace_client.statement_execution.execute_statement(
+                    warehouse_id=warehouse_id,
+                    statement=f"DROP SCHEMA IF EXISTS {catalog}.{schema} CASCADE",
+                )
+                report["schema_dropped"] = True
+            except Exception as e:
+                report["errors"].append(f"schema drop failed: {e}")
 
     return report
 
