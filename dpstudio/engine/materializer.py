@@ -219,6 +219,67 @@ resources:
 """
 
 
+def _fix_cross_node_execution_order(plan: dict) -> dict:
+    """Fixes a %run/dbutils.notebook.run call that fires BEFORE the calling
+    node has computed a variable the CHILD depends on.
+
+    Confirmed live: order_processor_wrapper.py computes `normalized_df` in its
+    own code, but the `%run ./data_writer` line sits BEFORE that computation
+    in the same file. Since %run shares the caller's namespace and executes
+    immediately at that line, data_writer.py (which reads normalized_df) runs
+    before the wrapper has produced it at all -- NameError, every time,
+    deterministically, regardless of model or prompt.
+
+    Fix: for each magic_run/dbutils_notebook_run edge, if the target node's
+    code references a variable name that ALSO appears as an assignment target
+    somewhere in the source node's OWN code, and that assignment sits AFTER
+    the reference line, move the reference line to immediately after the
+    last such assignment. This is a narrow, safe reorder (moving one line
+    later within the same node), not a general code-reordering attempt.
+    """
+    nodes_by_id = {n["node_id"]: n for n in plan.get("code_graph", {}).get("nodes", [])}
+    assign_re = re.compile(r"^\s*(\w+)\s*=[^=]")
+
+    for edge in plan.get("code_graph", {}).get("edges", []):
+        mech = edge.get("reference_mechanism")
+        if mech not in ("magic_run", "dbutils_notebook_run"):
+            continue
+        parent_id, child_id = edge["from_node"], edge["to_node"]
+        parent_code = plan.get("_node_code", {}).get(parent_id, {}).get("executable", [])
+        child_code = plan.get("_node_code", {}).get(child_id, {}).get("executable", [])
+        if not parent_code or not child_code:
+            continue
+
+        ref_idx = next((i for i, l in enumerate(parent_code)
+                        if "%run " in l or "dbutils.notebook.run(" in l), None)
+        if ref_idx is None:
+            continue
+
+        child_vars_used = set()
+        for line in child_code:
+            child_vars_used.update(re.findall(r"\b([a-z_][a-z0-9_]*)\b", line))
+
+        last_needed_assignment_idx = ref_idx
+        for i, line in enumerate(parent_code):
+            m = assign_re.match(line)
+            if m and m.group(1) in child_vars_used and i > last_needed_assignment_idx:
+                last_needed_assignment_idx = i
+
+        if last_needed_assignment_idx > ref_idx:
+            ref_line = parent_code[ref_idx]
+            new_code = parent_code[:ref_idx] + parent_code[ref_idx + 1:last_needed_assignment_idx + 1] \
+                      + [ref_line] + parent_code[last_needed_assignment_idx + 1:]
+            plan["_node_code"][parent_id]["executable"] = new_code
+            plan.setdefault("plan_notes", "")
+            plan["plan_notes"] = (
+                f"{plan['plan_notes']} fix_cross_node_execution_order: moved the "
+                f"%run/dbutils.notebook.run call to node {child_id} later in "
+                f"{parent_id}'s own code -- it was invoked before {parent_id} had "
+                f"computed a variable {child_id}'s code depends on."
+            ).strip()
+    return plan
+
+
 def _fix_python_imports(plan: dict, out_dir: Path) -> dict:
     """Fixes THREE distinct import/environment problems, each found via actual
     live execution -- none of these were ever visible to any static check,
@@ -468,6 +529,7 @@ def materialize(plan: dict, out_dir: str | Path) -> dict:
     whl = _build_wheel(plan, out_dir, artifacts)
 
     plan = _fix_python_imports(plan, out_dir)
+    plan = _fix_cross_node_execution_order(plan)
     plan = _strip_duplicated_reference_lines(plan)
     plan = _connect_orphaned_nodes(plan)
 
